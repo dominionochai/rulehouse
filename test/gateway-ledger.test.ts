@@ -15,6 +15,7 @@ function record(overrides: Partial<LedgerRecord> = {}): LedgerRecord {
     decision: { kind: "allowed", ruleId: "RH-GW-READ", reason: "read allowed" },
     enforcement: "forwarded-to-upstream",
     upstreamStatus: 200,
+    provenance: null,
     ...overrides,
   };
 }

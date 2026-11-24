@@ -22,9 +22,17 @@
     "rules": [
       { "id": "RH-GW-READ", "identities": null, "tools": ["get_*", "search_*", "list_*"], "effect": "allow" },
       { "id": "RH-GW-MUTATE-APPROVED", "identities": ["amara"], "tools": ["update_*", "create_*"], "effect": "allow", "approval": "required" },
-      { "id": "RH-GW-NO-DELETE", "identities": null, "tools": ["delete_*"], "effect": "deny" }
+      { "id": "RH-GW-NO-DELETE", "identities": null, "tools": ["delete_*"], "effect": "deny" },
+      {
+        "id": "RH-GW-POST-DECLARED",
+        "identities": ["amara"],
+        "tools": ["post_comment"],
+        "effect": "allow",
+        "provenanceChecks": [{ "argument": "body", "requireTrust": ["trusted"] }]
+      }
     ]
   },
   "ledger": { "path": "rulehouse-gateway-ledger.jsonl" },
+  "provenance": { "path": "examples/gateway/provenance.jsonl" },
   "approvals": { "path": "examples/gateway/approvals.txt" }
 }

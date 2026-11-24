@@ -1,10 +1,13 @@
-import { appendFile, readFile } from "node:fs/promises";
-import { canonicalize, isJsonObject, sha256Hex, type Json } from "../lib/json.js";
+import { ChainWriter, chainHash, readChain, verifyChain, GENESIS_PREV } from "../lib/chain.js";
+import { isJsonObject, type Json, type JsonObject } from "../lib/json.js";
+import { parseProvenanceFacts, type ProvenanceFact } from "../provenance.js";
+
+export { GENESIS_PREV };
 
 /**
  * Why a tool call was mediated the way it was. The record explicitly
  * distinguishes the *decision* (policy, attribution, reason) from the
- * *enforcement result* (what actually happened to the request) — collapsing
+ * *enforcement result* (what actually happened to the request) -- collapsing
  * the two is exactly how "we would have blocked it" drifts into "we blocked
  * it" in an audit trail.
  */
@@ -20,35 +23,12 @@ export interface LedgerRecord {
   };
   readonly enforcement: "blocked-at-gateway" | "forwarded-to-upstream" | "failed-forwarding";
   readonly upstreamStatus: number | null;
-}
-
-export const GENESIS_PREV = `sha256:${sha256Hex("rulehouse.ledger.genesis")}`;
-
-interface EntryCore {
-  readonly seq: number;
-  readonly at: string;
-  readonly prev: string;
-}
-
-function coreOf(record: LedgerRecord, core: EntryCore): Json {
-  return {
-    seq: core.seq,
-    at: core.at,
-    prev: core.prev,
-    record: {
-      decisionId: record.decisionId,
-      identity: record.identity,
-      method: record.method,
-      tool: record.tool,
-      decision: { kind: record.decision.kind, ruleId: record.decision.ruleId, reason: record.decision.reason },
-      enforcement: record.enforcement,
-      upstreamStatus: record.upstreamStatus,
-    },
-  };
-}
-
-export function ledgerEntryHash(core: EntryCore, record: LedgerRecord): string {
-  return `sha256:${sha256Hex(canonicalize(coreOf(record, core)))}`;
+  /**
+   * Provenance facts consulted for the applied rule, or null when no
+   * provenance check was involved. Older entries written before provenance
+   * existed read back as null.
+   */
+  readonly provenance: readonly ProvenanceFact[] | null;
 }
 
 export interface LedgerEntry {
@@ -59,6 +39,25 @@ export interface LedgerEntry {
   readonly record: LedgerRecord;
 }
 
+export function ledgerEntryHash(core: Pick<LedgerEntry, "seq" | "at" | "prev">, record: LedgerRecord): string {
+  return chainHash(core.seq, core.at, core.prev, decisionRecordOf(record));
+}
+
+function decisionRecordOf(record: LedgerRecord): JsonObject {
+  return {
+    decisionId: record.decisionId,
+    identity: record.identity,
+    method: record.method,
+    tool: record.tool,
+    decision: { kind: record.decision.kind, ruleId: record.decision.ruleId, reason: record.decision.reason },
+    enforcement: record.enforcement,
+    upstreamStatus: record.upstreamStatus,
+    provenance: record.provenance === null
+      ? null
+      : record.provenance.map((fact) => ({ argument: fact.argument, contentSha256: fact.contentSha256, trust: fact.trust })),
+  };
+}
+
 export interface LedgerRead {
   readonly entries: readonly LedgerEntry[];
   /** Index of the first entry that fails verification, or null when intact. */
@@ -67,27 +66,7 @@ export interface LedgerRead {
 }
 
 export async function readLedger(path: string): Promise<LedgerRead> {
-  const text = await readFile(path, "utf8").catch(() => null);
-  if (text === null) {
-    return { entries: [], breakAt: null, problem: null };
-  }
-
-  const entries: LedgerEntry[] = [];
-  const lines = text.split("\n").filter((line) => line.length > 0);
-  for (const line of lines) {
-    let document: Json;
-    try {
-      document = JSON.parse(line) as Json;
-    } catch {
-      return { entries, breakAt: entries.length, problem: `line ${entries.length + 1} is not valid JSON` };
-    }
-    const parsed = parseEntry(document);
-    if (parsed === null) {
-      return { entries, breakAt: entries.length, problem: `line ${entries.length + 1} is not a ledger entry` };
-    }
-    entries.push({ seq: parsed.seq, at: parsed.at, prev: parsed.prev, hash: parsed.hash, record: parsed.record });
-  }
-  return { entries, breakAt: null, problem: null };
+  return await readChain(path, parseRecord);
 }
 
 export interface LedgerVerification {
@@ -98,92 +77,31 @@ export interface LedgerVerification {
 }
 
 /**
- * Recomputes every entry hash and the chain linkage from genesis. Any edit,
- * deletion, insertion, or reorder changes at least one hash, so tampering is
- * never silent — the same doctrine as snapshot fingerprints, applied to an
- * append-only stream.
+ * Verifies the append-only chain without committing to the record schema:
+ * the hashes alone carry the tamper-evidence argument, and `ledger` is the
+ * generic integrity command for any Rulehouse chain file. Structural
+ * fidelity of decision records belongs to `readLedger`.
  */
 export async function verifyLedger(path: string): Promise<LedgerVerification> {
-  const read = await readLedger(path);
-  if (read.problem !== null) {
-    return { ok: false, entries: read.entries.length, breakAt: read.breakAt, problem: read.problem };
-  }
-  let expectedPrev = GENESIS_PREV;
-  for (const [index, entry] of read.entries.entries()) {
-    if (entry.seq !== index) {
-      return { ok: false, entries: read.entries.length, breakAt: index, problem: `entry ${index} has seq ${entry.seq}` };
-    }
-    if (entry.prev !== expectedPrev) {
-      return { ok: false, entries: read.entries.length, breakAt: index, problem: `entry ${index} chains to ${entry.prev}, expected ${expectedPrev}` };
-    }
-    const recomputed = ledgerEntryHash(entry, entry.record);
-    if (recomputed !== entry.hash) {
-      return { ok: false, entries: read.entries.length, breakAt: index, problem: `entry ${index} hash mismatch: recorded ${entry.hash}, recomputed ${recomputed}` };
-    }
-    expectedPrev = entry.hash;
-  }
-  return { ok: true, entries: read.entries.length, breakAt: null, problem: null };
+  return await verifyChain(path);
 }
 
 /**
- * Append-only ledger writer. The writer caches the chain head from creation
- * time, so a gateway instance pays one file read at startup and one append
- * per decision afterward. Single-process ownership is a stated limitation,
- * not an accident — it is what keeps the chain consistent without a lock.
+ * Typed front of the shared chain writer for decision records. `ChainWriter`
+ * holds the single-process chain-head cache; this wrapper only narrows what
+ * callers are allowed to commit.
  */
 export class LedgerWriter {
-  private nextSeq = 0;
-  private prevHash = GENESIS_PREV;
-
-  private constructor(readonly path: string) {}
+  private constructor(private readonly chain: ChainWriter, readonly path: string) {}
 
   static async open(path: string): Promise<LedgerWriter> {
-    const writer = new LedgerWriter(path);
-    const read = await readLedger(path);
-    const last = read.entries.at(-1);
-    if (last !== undefined && read.problem === null) {
-      writer.nextSeq = last.seq + 1;
-      writer.prevHash = last.hash;
-    }
-    return writer;
+    return new LedgerWriter(await ChainWriter.open(path), path);
   }
 
   async append(record: LedgerRecord, at: string): Promise<LedgerEntry> {
-    const core: EntryCore = { seq: this.nextSeq, at, prev: this.prevHash };
-    const hash = ledgerEntryHash(core, record);
-    const entry: LedgerEntry = { ...core, hash, record };
-    await appendFile(this.path, `${JSON.stringify({
-      seq: entry.seq,
-      at: entry.at,
-      prev: entry.prev,
-      hash: entry.hash,
-      record: entry.record,
-    })}\n`, "utf8");
-    this.nextSeq = entry.seq + 1;
-    this.prevHash = entry.hash;
-    return entry;
+    const entry = await this.chain.append(decisionRecordOf(record), at);
+    return { ...entry, record };
   }
-}
-
-interface RawEntry {
-  readonly seq: number;
-  readonly at: string;
-  readonly prev: string;
-  readonly hash: string;
-  readonly record: LedgerRecord;
-}
-
-function parseEntry(document: Json): RawEntry | null {
-  if (!isJsonObject(document)) return null;
-  const seq = document["seq"];
-  const at = document["at"];
-  const prev = document["prev"];
-  const hash = document["hash"];
-  const record = document["record"];
-  if (typeof seq !== "number" || typeof at !== "string" || typeof prev !== "string" || typeof hash !== "string") return null;
-  const parsedRecord = parseRecord(record);
-  if (parsedRecord === null) return null;
-  return { seq, at, prev, hash, record: parsedRecord };
 }
 
 function parseRecord(value: Json | undefined): LedgerRecord | null {
@@ -201,6 +119,12 @@ function parseRecord(value: Json | undefined): LedgerRecord | null {
   if (enforcement !== "blocked-at-gateway" && enforcement !== "forwarded-to-upstream" && enforcement !== "failed-forwarding") return null;
   const upstreamStatus = value["upstreamStatus"];
   if (upstreamStatus !== null && (typeof upstreamStatus !== "number" || !Number.isInteger(upstreamStatus))) return null;
+  const provenanceField = value["provenance"];
+  let provenance: readonly ProvenanceFact[] | null = null;
+  if (provenanceField !== undefined && provenanceField !== null) {
+    provenance = parseProvenanceFacts(provenanceField);
+    if (provenance === null) return null;
+  }
   return {
     decisionId,
     identity,
@@ -209,6 +133,7 @@ function parseRecord(value: Json | undefined): LedgerRecord | null {
     decision,
     enforcement,
     upstreamStatus,
+    provenance,
   };
 }
 

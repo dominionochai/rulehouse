@@ -2,6 +2,10 @@ import type { ScanDiagnostic } from "../model.js";
 import { isJsonObject, parseLooseJson, type Json } from "../lib/json.js";
 import type { JsonObject } from "../lib/json.js";
 import { decomposeAuthorizationHeader } from "../lib/secrets.js";
+import type { ProvenanceTrust } from "../provenance.js";
+
+export type { ProvenanceTrust };
+const TRUSTS: readonly ProvenanceTrust[] = ["trusted", "untrusted", "unverified"];
 
 export type IdentityKind = "user" | "service-account" | "agent";
 const IDENTITY_KINDS: readonly IdentityKind[] = ["user", "service-account", "agent"];
@@ -19,6 +23,17 @@ export interface GatewayIdentity {
 
 export type GatewayEffect = "allow" | "deny";
 
+export interface ProvenanceCheck {
+  /** Name of the tool-call argument whose content must resolve in the registry. */
+  readonly argument: string;
+  /**
+   * Declared trust values that satisfy the check. Content with no registry
+   * record (`unclassified`) satisfies nothing: a rule can only ever trust
+   * content that someone explicitly declared.
+   */
+  readonly requireTrust: readonly ProvenanceTrust[];
+}
+
 export interface GatewayRule {
   readonly id: string;
   /** Names this rule applies to; `null` matches every identity. */
@@ -27,6 +42,13 @@ export interface GatewayRule {
   readonly effect: GatewayEffect;
   /** Only meaningful with `effect: "allow"`. */
   readonly approvalRequired: boolean;
+  /**
+   * Provenance conditions on the rule. A matched rule applies only if every
+   * check resolves to an accepted declared trust; otherwise evaluation falls
+   * through to later rules. Untrusted content therefore cannot ride on an
+   * allow rule written for trusted work.
+   */
+  readonly provenanceChecks: readonly ProvenanceCheck[];
 }
 
 export interface GatewayPolicies {
@@ -64,6 +86,12 @@ export interface GatewayConfig {
   readonly policies: GatewayPolicies;
   readonly ledgerPath: string;
   /**
+   * When set, the path of a provenance registry (an append-only chain of
+   * `ProvenanceRecord`s). Re-read per request like approvals, so a
+   * re-classification takes effect immediately.
+   */
+  readonly provenancePath: string | null;
+  /**
    * When set, `approval-required` denials become allows once the decision id
    * appears in this newline-delimited file. Approvals are re-checked per
    * request, never cached, so revoking an approval takes effect immediately.
@@ -100,7 +128,8 @@ export function readGatewayConfig(
 
   const upstream = readUpstream(root["upstream"], resolveEnv, fail);
   const identities = readIdentities(root["identities"], fail);
-  const policies = readPolicies(root["policies"], identities, fail);
+  const provenancePath = readProvenancePath(root["provenance"], fail);
+  const policies = readPolicies(root["policies"], identities, provenancePath !== null, fail);
   const listen = readListen(root["listen"], fail);
   const ledgerPath = readLedgerPath(root["ledger"], fail);
   const approvalsPath = readOptionalString(root["approvals"]);
@@ -114,6 +143,7 @@ export function readGatewayConfig(
         identities,
         policies,
         ledgerPath,
+        provenancePath,
         approvalsPath,
       }
     : null;
@@ -220,9 +250,28 @@ function readIdentities(
   return ok ? identities : null;
 }
 
+function readProvenancePath(
+  value: Json | undefined,
+  fail: (subject: string, message: string) => void,
+): string | null {
+  if (value === undefined) return null;
+  const obj = asObject(value);
+  if (obj === null) {
+    fail("/provenance", "must be an object with a \"path\" field");
+    return null;
+  }
+  const path = asString(obj["path"]);
+  if (path === null || path.length === 0) {
+    fail("/provenance/path", "must be a non-empty file path");
+    return null;
+  }
+  return path;
+}
+
 function readPolicies(
   value: Json | undefined,
   identities: readonly GatewayIdentity[] | null,
+  provenanceConfigured: boolean,
   fail: (subject: string, message: string) => void,
 ): GatewayPolicies | null {
   const obj = asObject(value);
@@ -257,6 +306,7 @@ function readPolicies(
     const ruleIdentities = identitiesField === undefined ? null : asStringArray(identitiesField);
     const effect = asString(ruleObj["effect"]);
     const approvalRequired = ruleObj["approval"] === "required";
+    const checks = readProvenanceChecks(ruleObj["provenanceChecks"], index, fail);
 
     if (id === null || id.length === 0) {
       fail(`/policies/rules/${index}/id`, "is required and must be a non-empty string");
@@ -289,10 +339,61 @@ function readPolicies(
       ok = false;
       continue;
     }
+    if (checks === null) {
+      ok = false;
+      continue;
+    }
+    if (checks.length > 0 && !provenanceConfigured) {
+      fail(`/policies/rules/${index}/provenanceChecks`, `rule "${id}" consults provenance but no top-level "provenance" path is configured; every check would resolve as unavailable`);
+      ok = false;
+      continue;
+    }
     seenIds.add(id);
-    rules.push({ id, identities: ruleIdentities, tools, effect, approvalRequired });
+    rules.push({ id, identities: ruleIdentities, tools, effect, approvalRequired, provenanceChecks: checks });
   }
   return ok ? { defaultEffect, rules } : null;
+}
+
+function readProvenanceChecks(
+  value: Json | undefined,
+  ruleIndex: number,
+  fail: (subject: string, message: string) => void,
+): readonly ProvenanceCheck[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    fail(`/policies/rules/${ruleIndex}/provenanceChecks`, "must be an array of { argument, requireTrust } objects");
+    return null;
+  }
+  const checks: ProvenanceCheck[] = [];
+  let ok = true;
+  for (const [index, element] of value.entries()) {
+    const obj = asObject(element);
+    if (obj === null) {
+      fail(`/policies/rules/${ruleIndex}/provenanceChecks/${index}`, "must be an object");
+      ok = false;
+      continue;
+    }
+    const argument = asString(obj["argument"]);
+    if (argument === null || argument.length === 0) {
+      fail(`/policies/rules/${ruleIndex}/provenanceChecks/${index}/argument`, "is required and must be a non-empty argument name");
+      ok = false;
+      continue;
+    }
+    const requireTrust = asStringArray(obj["requireTrust"]);
+    if (requireTrust === null || requireTrust.length === 0) {
+      fail(`/policies/rules/${ruleIndex}/provenanceChecks/${index}/requireTrust`, `must be a non-empty array drawn from ${TRUSTS.join(", ")}`);
+      ok = false;
+      continue;
+    }
+    const invalid = requireTrust.filter((trust) => !TRUSTS.includes(trust as ProvenanceTrust));
+    if (invalid.length > 0) {
+      fail(`/policies/rules/${ruleIndex}/provenanceChecks/${index}/requireTrust`, `unknown trust value(s): ${invalid.join(", ")}; content with no registry record satisfies nothing`);
+      ok = false;
+      continue;
+    }
+    checks.push({ argument, requireTrust: requireTrust as readonly ProvenanceTrust[] });
+  }
+  return ok ? checks : null;
 }
 
 function readListen(

@@ -5,6 +5,8 @@ import { createServer, type Server } from "node:http";
 import type { GatewayConfig, GatewayIdentity } from "./config.js";
 import { METHOD_RULE_ID, evaluateToolCall, type Decision } from "./authorize.js";
 import { LedgerWriter, type LedgerRecord } from "./ledger.js";
+import { readProvenanceRegistry, type ProvenanceFact } from "../provenance.js";
+import { isJsonObject, type JsonObject } from "../lib/json.js";
 
 export const JSONRPC_PARSE_ERROR = -32700;
 export const JSONRPC_INVALID_REQUEST = -32600;
@@ -101,6 +103,7 @@ async function mediateOne(
         method: parseMethodSafely(body),
         tool: null,
         decision: { kind: "denied", ruleId: "RH-GW-AUTH", reason: "client presented no key matching a configured identity" },
+        provenance: null,
         status: 401,
       }, decisionIdOf(null, parseMethodSafely(body), null, ""), null);
       return;
@@ -148,7 +151,8 @@ async function mediateToolCall(
   }
 
   const decisionId = decisionIdOf(identity.name, parsed.method, parsed.tool, parsed.argumentsDigest);
-  const decision = evaluateToolCall(config.policies, identity.name, parsed.tool);
+  const registry = config.provenancePath === null ? null : await readProvenanceRegistry(config.provenancePath);
+  const decision = evaluateToolCall(config.policies, identity.name, parsed.tool, parsed.arguments, registry);
 
   if (decision.kind === "denied") {
     await reject(response, writer, {
@@ -156,6 +160,7 @@ async function mediateToolCall(
       method: parsed.method,
       tool: parsed.tool,
       decision: { kind: "denied" as const, ruleId: decision.ruleId, reason: decision.reason },
+      provenance: decision.provenance.length === 0 ? null : decision.provenance,
       status: 403,
     }, decisionId, parsed.id);
     return;
@@ -169,6 +174,7 @@ async function mediateToolCall(
         method: parsed.method,
         tool: parsed.tool,
         decision: { kind: "denied", ruleId: decision.ruleId, reason: `rule ${decision.ruleId} requires human approval; decision ${decisionId} is not approved yet` },
+        provenance: decision.provenance.length === 0 ? null : decision.provenance,
         status: 403,
       }, decisionId, parsed.id);
       return;
@@ -197,6 +203,7 @@ async function mediatePassthrough(
     identity: identity.name,
     method: parsed.method,
     tool: null,
+    provenance: null,
     decision: outcome.forwarded
       ? { kind: "allowed", ruleId: METHOD_RULE_ID, reason: `${parsed.method} mediated for ${identity.kind} ${identity.name}; non-tool traffic is mediated, tool policy does not apply` }
       : { kind: "denied", ruleId: METHOD_RULE_ID, reason: `upstream was unreachable for ${parsed.method}` },
@@ -210,6 +217,8 @@ interface ParsedRequest {
   readonly id: string | number | null;
   readonly method: string;
   readonly tool: string | null;
+  /** The structured tool-call arguments, when they parse as a JSON object. */
+  readonly arguments: JsonObject | null;
   readonly argumentsDigest: string;
 }
 
@@ -241,16 +250,17 @@ function parseJsonRpcRequest(body: string): ParsedRequest | string {
     return "JSON-RPC method must be a string";
   }
   const params = record["params"];
-  const tool = typeof params === "object" && params !== null && !Array.isArray(params)
-    ? asString((params as { readonly [key: string]: unknown })["name"])
+  const paramsObject = typeof params === "object" && params !== null && !Array.isArray(params)
+    ? (params as { readonly [key: string]: unknown })
     : null;
-  const invocation = tool !== null
-    ? { name: tool, arguments: (params as { readonly [key: string]: unknown })["arguments"] ?? null }
-    : null;
+  const tool = paramsObject === null ? null : asString(paramsObject["name"]);
+  const rawArguments = paramsObject === null ? null : paramsObject["arguments"] ?? null;
+  const invocation = tool !== null ? { name: tool, arguments: rawArguments } : null;
   return {
     id,
     method,
     tool,
+    arguments: isJsonObject(rawArguments) ? rawArguments : null,
     argumentsDigest: invocation === null ? "" : createHash("sha256").update(stableJson(invocation)).digest("hex"),
   };
 }
@@ -377,6 +387,7 @@ async function forwardAndRecord(
     identity: identity.name,
     method: parsed.method,
     tool: parsed.tool,
+    provenance: decision.provenance.length === 0 ? null : decision.provenance,
     decision: { kind: outcome.forwarded && outcome.status < 400 ? "allowed" : "denied", ruleId: decision.ruleId, reason },
     enforcement: outcome.forwarded ? "forwarded-to-upstream" : "failed-forwarding",
     upstreamStatus: outcome.forwarded ? outcome.status : null,
@@ -403,6 +414,7 @@ interface Rejection {
   readonly method: string | null;
   readonly tool: string | null;
   readonly decision: { readonly kind: "denied"; readonly ruleId: string; readonly reason: string };
+  readonly provenance: readonly ProvenanceFact[] | null;
   readonly status: number;
 }
 
@@ -421,6 +433,7 @@ async function reject(
     decision: rejection.decision,
     enforcement: "blocked-at-gateway",
     upstreamStatus: null,
+    provenance: rejection.provenance,
   };
   await writer.append(record, new Date().toISOString());
   respondJsonRpc(response, rejection.status, jsonRpcId, {

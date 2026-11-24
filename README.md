@@ -13,6 +13,10 @@ contains two working phases:
   client to an identity, evaluates tool policy, blocks disallowed tool
   calls **before execution**, and records every decision in a
   tamper-evident hash-chained ledger.
+- **Phase 3 — Provenance-aware enforcement (prototype)**: a
+  content-trust registry and policy conditions that stop content of
+  declared untrusted provenance from independently driving privileged
+  tool calls on mediated paths.
 
 **Scope honesty, up front.** Continuous Assurance discovers and verifies
 configuration. It does not intercept, mediate, or enforce anything: a
@@ -105,6 +109,61 @@ sit behind a TLS-terminating proxy. An unreachable upstream fails
 closed: the operation is not executed and the failure is recorded as
 `failed-forwarding`, which the ledger keeps distinct from both
 `blocked-at-gateway` and `forwarded-to-upstream`.
+
+## Provenance on mediated paths (Phase 3)
+
+The brief's distinction — **content an AI system can read is not
+automatically an instruction it is authorized to follow** — enforced as
+policy, at the only boundary where it can actually be enforced.
+
+- **The provenance registry** — an append-only file built on the same
+  hash chain as the decision ledger. Each record binds a content digest
+  (`contentSha256`) to an origin (`internal`/`external`/`derived`), a
+  trust declaration (`trusted`/`untrusted`/`unverified`), a source label,
+  and a mandatory classifier attribution (`labeledBy`). Content is never
+  stored; the registry describes what was seen, by digest. Re-registering
+  a digest supersedes the previous declaration and the chain keeps the
+  full history.
+- **Digesting rule** — a string argument digests over its exact UTF-8
+  bytes; any structured argument digests over canonical JSON (key order
+  does not change identity). A registered file and the mediated argument
+  therefore land on the same digest; paraphrased or re-serialized content
+  deliberately does not, because the registry certifies bytes, not
+  paraphrases.
+- **Provenance conditions on policy rules** — a rule can carry
+  `provenanceChecks` naming tool arguments and the declared trust values
+  they must resolve to. A matched rule whose checks do not resolve is
+  *skipped*, and evaluation continues down the written list — so
+  untrusted content cannot ride on an allow rule written for trusted
+  work, and a deny rule can be written to trigger exactly on declared
+  untrusted content. Content with no registry record satisfies nothing
+  (`unclassified`); a corrupt registry resolves as `unavailable` and
+  fails closed. Both the registry and the approvals file are re-read per
+  request, so re-classification takes effect on the next call.
+- **The decision ledger quotes its evidence** — entries for rules with
+  provenance checks carry the inspected digests and the trust the
+  registry resolved for them at decision time, and denials explain which
+  rule was skipped and what trust its check actually resolved.
+
+Register and inspect content (`-` reads stdin):
+
+```sh
+node dist/index.js provenance register examples/gateway/provenance.jsonl \
+  examples/gateway/contents/vendor-advisory.txt \
+  --origin external --trust untrusted \
+  --source webform:vendor-portal --labeled-by security-team
+node dist/index.js provenance inspect examples/gateway/provenance.jsonl examples/gateway/contents/runbook.md
+node dist/index.js ledger examples/gateway/provenance.jsonl   # the registry is a verifiable chain too
+```
+
+**Rovo honesty.** Phase 3 enforces provenance only on paths the gateway
+actually mediates. Native Rovo operations (server-side retrieval, URL
+fetching) never cross the gateway and remain outside every claim here.
+Published 2026 research (Varonis' RovoBlast; PromptArmor's URL-retrieval
+exfiltration) demonstrated exactly that gap: a feature toggle does not
+close an egress path that an adjacent capability still reaches. The
+correct posture — narrow product claim, detection and reporting only
+where telemetry permits — is retained rather than marketed over.
 
 ## Phase-1 scanner
 

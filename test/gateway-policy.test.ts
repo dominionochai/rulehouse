@@ -4,6 +4,9 @@ import { matchesPattern, matchesAnyPattern } from "../src/gateway/match.js";
 import { DEFAULT_RULE_ID, METHOD_RULE_ID, evaluateToolCall } from "../src/gateway/authorize.js";
 import { readGatewayConfig } from "../src/gateway/config.js";
 import type { GatewayPolicies } from "../src/gateway/config.js";
+import { contentDigestOf, type ProvenanceRecord, type ProvenanceRegistry, type ProvenanceTrust } from "../src/provenance.js";
+import type { Decision } from "../src/gateway/authorize.js";
+import type { JsonObject } from "../src/lib/json.js";
 
 test("tool patterns match literally except for the star wildcard", () => {
   assert.equal(matchesPattern("get_issue", "get_issue"), true);
@@ -24,10 +27,10 @@ test("tool patterns match literally except for the star wildcard", () => {
 const POLICIES: GatewayPolicies = {
   defaultEffect: "deny",
   rules: [
-    { id: "RH-GW-BLOCK-DELETE", identities: null, tools: ["delete_*"], effect: "deny", approvalRequired: false },
-    { id: "RH-GW-READ-ALL", identities: null, tools: ["get_*", "search_*"], effect: "allow", approvalRequired: false },
-    { id: "RH-GW-MUTATE-APPROVED", identities: ["amara"], tools: ["update_*"], effect: "allow", approvalRequired: true },
-    { id: "RH-GW-BOT-READ", identities: ["runbook-agent"], tools: ["search_*"], effect: "allow", approvalRequired: false },
+    { id: "RH-GW-BLOCK-DELETE", identities: null, tools: ["delete_*"], effect: "deny", approvalRequired: false, provenanceChecks: [] },
+    { id: "RH-GW-READ-ALL", identities: null, tools: ["get_*", "search_*"], effect: "allow", approvalRequired: false, provenanceChecks: [] },
+    { id: "RH-GW-MUTATE-APPROVED", identities: ["amara"], tools: ["update_*"], effect: "allow", approvalRequired: true, provenanceChecks: [] },
+    { id: "RH-GW-BOT-READ", identities: ["runbook-agent"], tools: ["search_*"], effect: "allow", approvalRequired: false, provenanceChecks: [] },
   ],
 };
 
@@ -161,3 +164,170 @@ test("config validation gives each defect a precise diagnostic and fails closed"
 test("the mediated-method rule id is distinct and specific", () => {
   assert.notEqual(METHOD_RULE_ID, DEFAULT_RULE_ID);
 });
+
+function digest(content: string | JsonObject): string {
+  return contentDigestOf(content);
+}
+
+function registry(entries: Record<string, ProvenanceTrust>): ProvenanceRegistry {
+  const records = new Map<string, ProvenanceRecord>();
+  for (const [contentSha256, trust] of Object.entries(entries)) {
+    records.set(contentSha256, {
+      contentSha256,
+      trust,
+      origin: "external",
+      source: "test-fixture",
+      labeledBy: "test",
+      labeledAt: "2026-01-01T00:00:00.000Z",
+    });
+  }
+  return { records, corrupt: null };
+}
+
+function emptyRegistry(): ProvenanceRegistry {
+  return { records: new Map(), corrupt: null };
+}
+
+test("a provenance condition is satisfied only by accepted declared trust", () => {
+  const policies: GatewayPolicies = {
+    defaultEffect: "deny",
+    rules: [
+      {
+        id: "RH-GW-POST-DECLARED",
+        identities: null,
+        tools: ["post_comment"],
+        effect: "allow",
+        approvalRequired: false,
+        provenanceChecks: [{ argument: "body", requireTrust: ["trusted"] }],
+      },
+    ],
+  };
+  const trusted = evaluateToolCall(policies, "amara", "post_comment",
+    { body: "approved runbook text" }, registry({ [digest("approved runbook text")]: "trusted" }));
+  assert.equal(trusted.kind, "allowed");
+  assert.equal(trusted.ruleId, "RH-GW-POST-DECLARED");
+  assert.equal(trusted.provenance.length, 1);
+  assert.equal(trusted.provenance[0]?.trust, "trusted");
+  assert.equal(trusted.provenance[0]?.argument, "body");
+});
+
+test("untrusted content does not ride on an allow rule written for trusted work", () => {
+  const policies: GatewayPolicies = {
+    defaultEffect: "deny",
+    rules: [
+      {
+        id: "RH-GW-POST-DECLARED",
+        identities: null,
+        tools: ["post_comment"],
+        effect: "allow",
+        approvalRequired: false,
+        provenanceChecks: [{ argument: "body", requireTrust: ["trusted"] }],
+      },
+    ],
+  };
+  const denied = evaluateToolCall(policies, "amara", "post_comment",
+    { body: "attacker text" }, registry({ [digest("attacker text")]: "untrusted" }));
+  assert.equal(denied.kind, "denied");
+  assert.equal(denied.ruleId, DEFAULT_RULE_ID, "the allow rule is skipped, and the default denies");
+  assert.ok(denied.reason.includes("RH-GW-POST-DECLARED"), "the denial explains why the allow rule was skipped");
+  assert.ok(denied.reason.includes("untrusted"));
+});
+
+test("structured content resolves through canonical digesting, key order included", () => {
+  const policies: GatewayPolicies = {
+    defaultEffect: "deny",
+    rules: [
+      {
+        id: "RH-GW-STRUCT",
+        identities: null,
+        tools: ["post_comment"],
+        effect: "allow",
+        approvalRequired: false,
+        provenanceChecks: [{ argument: "body", requireTrust: ["trusted"] }],
+      },
+    ],
+  };
+  const trusted = evaluateToolCall(policies, "amara", "post_comment",
+    { body: { text: "a", meta: { b: 1, a: 2 } } }, registry({ [digest({ text: "a", meta: { a: 2, b: 1 } })]: "trusted" }));
+  assert.equal(trusted.kind, "allowed", "canonically equal structures resolve to the same digest");
+});
+
+test("unclassified and unavailable content satisfies no trust requirement", () => {
+  const policies: GatewayPolicies = {
+    defaultEffect: "deny",
+    rules: [
+      {
+        id: "RH-GW-POST-DECLARED",
+        identities: null,
+        tools: ["post_comment"],
+        effect: "allow",
+        approvalRequired: false,
+        provenanceChecks: [{ argument: "body", requireTrust: ["trusted"] }],
+      },
+    ],
+  };
+  const checks = (registry: ProvenanceRegistry | null, args: JsonObject | null = { body: "x" }): "allowed" | "denied" =>
+    evaluateToolCall(policies, "amara", "post_comment", args, registry).kind;
+
+  assert.equal(checks(null, { body: "x" }), "denied", "no registry configured");
+  assert.equal(checks(emptyRegistry()), "denied", "healthy registry, digest not present");
+  assert.equal(checks(emptyRegistry(), null), "denied", "call carries no arguments to inspect");
+  assert.equal(checks(emptyRegistry(), { other: "x" }), "denied", "checked argument is absent");
+  assert.equal(checks({ records: new Map(), corrupt: "line 1 problem" }, { body: "x" }), "denied", "corrupt registry");
+});
+
+test("a deny rule gated on untrusted content enforces exactly that content", () => {
+  const policies: GatewayPolicies = {
+    defaultEffect: "allow",
+    rules: [
+      {
+        id: "RH-GW-NO-UNTRUSTED",
+        identities: null,
+        tools: ["run_workflow"],
+        effect: "deny",
+        approvalRequired: false,
+        provenanceChecks: [{ argument: "input", requireTrust: ["untrusted"] }],
+      },
+    ],
+  };
+  const denied = evaluateToolCall(policies, "amara", "run_workflow",
+    { input: "external form text" }, registry({ [digest("external form text")]: "untrusted" }));
+  assert.equal(denied.kind, "denied");
+  assert.equal(denied.ruleId, "RH-GW-NO-UNTRUSTED");
+
+  const allowed = evaluateToolCall(policies, "amara", "run_workflow",
+    { input: "internal text" }, registry({ [digest("internal text")]: "trusted" }));
+  assert.equal(allowed.kind, "allowed", "declared-trusted content escapes the deny rule");
+});
+
+test("config validation refuses provenance checks it could never satisfy", () => {
+  const base = () => ({
+    listen: { host: "127.0.0.1", port: 8080 },
+    upstream: { url: "https://mcp.atlassian.com/v2/mcp", credentialEnv: "K" },
+    identities: [{ name: "amara", kind: "user", keyHash: `sha256:${"a".repeat(64)}` }],
+    policies: {
+      defaultEffect: "deny",
+      rules: [{
+        id: "R", identities: ["amara"], tools: ["post_*"], effect: "allow",
+        provenanceChecks: [{ argument: "body", requireTrust: ["trusted"] }],
+      }],
+    },
+  });
+  const env = (): string | undefined => undefined;
+
+  const missingRegistry = readGatewayConfig(JSON.stringify(base()), "config.json", env);
+  assert.ok(missingRegistry.diagnostics.some((d) => d.message.includes("no top-level \"provenance\" path")),
+    "checks without a configured registry are dead rules");
+
+  const badTrust = readGatewayConfig(JSON.stringify({
+    ...base(),
+    provenance: { path: "provenance.jsonl" },
+    policies: { defaultEffect: "deny", rules: [{
+      id: "R", identities: ["amara"], tools: ["post_*"], effect: "allow",
+      provenanceChecks: [{ argument: "body", requireTrust: ["unclassified"] }],
+    }] },
+  }), "config.json", env);
+  assert.ok(badTrust.diagnostics.some((d) => d.message.includes("unknown trust value")),
+    "unclassified/unavailable are observed states, not declarations an operator can require");
+});
+

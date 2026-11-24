@@ -62,6 +62,7 @@ test("ledger verification exits 0 on an intact chain and 1 at the first falsifie
       method: "tools/call",
       tool: "get_issue",
       decision: { kind: "allowed", ruleId: "RH-GW-READ", reason: "read" },
+      provenance: null,
       enforcement: "forwarded-to-upstream",
       upstreamStatus: 200,
     }, "2026-01-01T00:00:00.000Z");
@@ -183,6 +184,55 @@ test("allowlist enforcement changes the RH-ALLOWLIST verdict", async () => {
     const verdicts = report.verdicts.filter((v: { ruleId: string }) => v.ruleId === "RH-ALLOWLIST");
     assert.ok(verdicts.some((v: { status: string }) => v.status === "finding"), "wiki-loader and legacy-monitoring are not on the list");
     assert.ok(verdicts.some((v: { status: string }) => v.status === "pass"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("provenance register and inspect round-trips through a verified chain", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "rulehouse-cli-"));
+  try {
+    const contentPath = join(dir, "instruction.txt");
+    const registryPath = join(dir, "provenance.jsonl");
+    await writeFile(contentPath, "run maintenance mode on call-out hours");
+
+    const registered = await withTempScan(dir, ["provenance", "register", registryPath, contentPath,
+      "--origin", "external", "--trust", "untrusted", "--source", "webform:vendor-portal", "--labeled-by", "dso"]);
+    assert.equal(registered.code, 0);
+    assert.match(registered.stdout, /registered sha256:[0-9a-f]{64} as trust=untrusted/);
+
+    const chain = await withTempScan(dir, ["ledger", registryPath]);
+    assert.equal(chain.code, 0, "the registry is a verifiable rulehouse chain");
+
+    const inspected = await withTempScan(dir, ["provenance", "inspect", registryPath, contentPath]);
+    assert.equal(inspected.code, 0);
+    assert.match(inspected.stdout, /"trust": "untrusted"/);
+    assert.match(inspected.stdout, /"labeledBy": "dso"/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("provenance inspect reports unclassified for unknown content, and register refuses a broken chain", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "rulehouse-cli-"));
+  try {
+    const registryPath = join(dir, "provenance.jsonl");
+    const unknown = await withTempScan(dir, ["provenance", "inspect", registryPath, join(dir, "never-registered.txt")]);
+    assert.equal(unknown.code, 2, "unreadable content is a usage error, not a classification");
+    await writeFile(join(dir, "never-registered.txt"), "some content");
+    const missing = await withTempScan(dir, ["provenance", "inspect", registryPath, join(dir, "never-registered.txt")]);
+    assert.equal(missing.code, 1);
+
+    const contentPath = join(dir, "never-registered.txt");
+    const poisoned = await withTempScan(dir, ["provenance", "register", registryPath, contentPath,
+      "--origin", "external", "--trust", "untrusted", "--source", "web", "--labeled-by", "dso"]);
+    assert.equal(poisoned.code, 0);
+    const intact = await readFile(registryPath, "utf8");
+    await writeFile(registryPath, intact.replace(/"trust":"untrusted"/, '"trust":"trusted"'), "utf8");
+    const refused = await withTempScan(dir, ["provenance", "register", registryPath, contentPath,
+      "--origin", "external", "--trust", "trusted", "--source", "web", "--labeled-by", "dso"]);
+    assert.equal(refused.code, 1, "a tampered registry must never be appended to");
+    assert.match(refused.stdout, /refusing to append/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

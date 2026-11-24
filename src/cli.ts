@@ -1,4 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendProvenanceRecord, contentDigestOfText, readProvenanceRegistry,
+  type ProvenanceOrigin, type ProvenanceTrust } from "./provenance.js";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { diffSnapshots, type SnapshotDiff } from "./diff.js";
@@ -9,6 +11,7 @@ import { resolveFromProcessEnv } from "./parse.js";
 import { readGatewayConfig } from "./gateway/config.js";
 import { createGateway } from "./gateway/server.js";
 import { verifyLedger } from "./gateway/ledger.js";
+import { verifyChain } from "./lib/chain.js";
 import { fingerprintOf, readSnapshotFile, snapshotOf, writeSnapshotFile } from "./snapshot.js";
 import { VERSION } from "./version.js";
 
@@ -18,7 +21,7 @@ interface CommandLine {
   readonly flags: ReadonlyMap<string, string | true>;
 }
 
-const FLAG_WITH_VALUE = new Set(["--allowlist", "--config", "--out", "--root"]);
+const FLAG_WITH_VALUE = new Set(["--allowlist", "--config", "--out", "--root", "--origin", "--trust", "--source", "--labeled-by"]);
 
 function parseCommandLine(argv: readonly string[]): CommandLine | null {
   if (argv.length === 0) return null;
@@ -52,6 +55,8 @@ Usage:
   rulehouse verify <snapshot.json> --root <root>
   rulehouse serve --config <file>
   rulehouse ledger <file.jsonl>
+  rulehouse provenance register <registry.jsonl> <file> --origin <o> --trust <t> --source <label> --labeled-by <who>
+  rulehouse provenance inspect <registry.jsonl> <file>
   rulehouse help
 
 Commands:
@@ -63,6 +68,15 @@ Commands:
   verify   Re-derive the SHA-256 of every input file recorded in a snapshot
            (resolved against --root) and re-compute the snapshot fingerprint.
            Exit code 0 when every digest matches, 1 on drift, 2 on error.
+  ledger   Verify the append-only hash chain of a decision ledger or
+           provenance registry. Exit 0 intact, 1 broken, 2 error.
+  provenance
+           Register content trust by digest, or inspect what trust a content
+           file (or "-" for stdin) resolves to. The gateway consults this
+           registry per request: a policy rule with provenanceChecks only
+           grants effect when the named argument's content resolves to an
+           accepted declared trust. Re-registering a digest supersedes the
+           previous record; the chain keeps the full history.
 
 Credentials are never emitted: configuration secrets are stored only as
 SHA-256 fingerprint prefixes.
@@ -242,6 +256,96 @@ async function commandServe(options: CommandLine): Promise<number> {
   return 0;
 }
 
+const PROVENANCE_ORIGINS: readonly ProvenanceOrigin[] = ["internal", "external", "derived"];
+const PROVENANCE_TRUSTS: readonly ProvenanceTrust[] = ["trusted", "untrusted", "unverified"];
+
+async function readContentSource(pathArg: string | undefined): Promise<string | null> {
+  if (pathArg === undefined) return null;
+  if (pathArg === "-") {
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+    return Buffer.concat(chunks).toString("utf8");
+  }
+  return await readFile(pathArg, "utf8").catch(() => null);
+}
+
+async function commandProvenance(options: CommandLine): Promise<number> {
+  const verb = options.positional[0];
+  const registryPath = options.positional[1];
+  if (verb !== "register" && verb !== "inspect") {
+    process.stderr.write('provenance requires a verb: "register" or "inspect"\n');
+    return 2;
+  }
+  if (typeof registryPath !== "string") {
+    process.stderr.write(`provenance ${verb} requires <registry.jsonl> <file|->\n`);
+    return 2;
+  }
+  const text = await readContentSource(options.positional[2]);
+  if (text === null) {
+    process.stderr.write(`provenance ${verb} could not read content ${options.positional[2] ?? "(missing)"}\n`);
+    return 2;
+  }
+  const digest = contentDigestOfText(text);
+
+  if (verb === "register") {
+    const flagValue = (name: string): string | null => {
+      const value = options.flags.get(name);
+      return typeof value === "string" ? value : null;
+    };
+    const origin = flagValue("--origin");
+    const trust = flagValue("--trust");
+    const source = flagValue("--source");
+    const labeledBy = flagValue("--labeled-by");
+    if (origin === null || trust === null || source === null || labeledBy === null
+      || origin.length === 0 || source.length === 0 || labeledBy.length === 0) {
+      process.stderr.write("provenance register requires --origin, --trust, --source, and --labeled-by\n");
+      return 2;
+    }
+    if (!PROVENANCE_ORIGINS.includes(origin as ProvenanceOrigin)) {
+      process.stderr.write(`--origin must be one of ${PROVENANCE_ORIGINS.join(", ")}, got "${origin}"\n`);
+      return 2;
+    }
+    if (!PROVENANCE_TRUSTS.includes(trust as ProvenanceTrust)) {
+      process.stderr.write(`--trust must be one of ${PROVENANCE_TRUSTS.join(", ")}, got "${trust}"\n`);
+      return 2;
+    }
+    const integrity = await verifyChain(registryPath);
+    if (!integrity.ok && integrity.problem !== null) {
+      process.stderr.write(`${registryPath}: refusing to append; the chain is broken at entry ${integrity.breakAt}: ${integrity.problem}\n`);
+      return 1;
+    }
+    let seq: number;
+    try {
+      seq = await appendProvenanceRecord(registryPath, {
+        contentSha256: digest,
+        origin: origin as ProvenanceOrigin,
+        trust: trust as ProvenanceTrust,
+        source,
+        labeledBy,
+        labeledAt: new Date().toISOString(),
+      }, new Date().toISOString());
+    } catch (error) {
+      process.stderr.write(`provenance register could not append to ${registryPath}: ${(error as Error).message}\n`);
+      return 2;
+    }
+    process.stdout.write(`registered ${digest} as trust=${trust} origin=${origin} source="${source}" labeled-by=${labeledBy} (entry ${seq} in ${registryPath})\n`);
+    return 0;
+  }
+
+  const registry = await readProvenanceRegistry(registryPath);
+  if (registry.corrupt !== null) {
+    process.stderr.write(`${registryPath}: BROKEN at provenance registry: ${registry.corrupt}\n`);
+    return 2;
+  }
+  const record = registry.records.get(digest);
+  if (record === undefined) {
+    process.stderr.write(`unclassified: ${digest} has no provenance record in ${registryPath}\n`);
+    return 1;
+  }
+  process.stdout.write(`${digest}\n${JSON.stringify(record, null, 2)}\n`);
+  return 0;
+}
+
 async function commandLedger(pathArg: string | undefined): Promise<number> {
   if (pathArg === undefined) {
     process.stderr.write("ledger requires <file.jsonl>\n");
@@ -273,6 +377,8 @@ export async function main(argv: readonly string[]): Promise<number> {
       return await commandServe(commandLine);
     case "ledger":
       return await commandLedger(commandLine.positional[0]);
+    case "provenance":
+      return await commandProvenance(commandLine);
     case "help":
     case "--help":
     case "-h":
