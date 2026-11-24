@@ -6,6 +6,9 @@ import { scanRoot } from "./discover.js";
 import { evaluatePolicy, type Allowlist } from "./policy.js";
 import { findingsOf, renderMarkdownReport, scanReportOf } from "./report.js";
 import { resolveFromProcessEnv } from "./parse.js";
+import { readGatewayConfig } from "./gateway/config.js";
+import { createGateway } from "./gateway/server.js";
+import { verifyLedger } from "./gateway/ledger.js";
 import { fingerprintOf, readSnapshotFile, snapshotOf, writeSnapshotFile } from "./snapshot.js";
 import { VERSION } from "./version.js";
 
@@ -15,7 +18,7 @@ interface CommandLine {
   readonly flags: ReadonlyMap<string, string | true>;
 }
 
-const FLAG_WITH_VALUE = new Set(["--allowlist", "--out", "--root"]);
+const FLAG_WITH_VALUE = new Set(["--allowlist", "--config", "--out", "--root"]);
 
 function parseCommandLine(argv: readonly string[]): CommandLine | null {
   if (argv.length === 0) return null;
@@ -47,6 +50,8 @@ Usage:
   rulehouse scan <root> [--allowlist <file>] [--out <dir>] [--strict]
   rulehouse diff <baseline.json> <current.json>
   rulehouse verify <snapshot.json> --root <root>
+  rulehouse serve --config <file>
+  rulehouse ledger <file.jsonl>
   rulehouse help
 
 Commands:
@@ -197,6 +202,60 @@ async function commandVerify(options: CommandLine): Promise<number> {
   return !fingerprintOk || drift > 0 ? 1 : 0;
 }
 
+
+async function commandServe(options: CommandLine): Promise<number> {
+  const configPath = options.flags.get("--config");
+  if (typeof configPath !== "string") {
+    process.stderr.write("serve requires --config <file>\n");
+    return 2;
+  }
+  const text = await readFile(configPath, "utf8").catch(() => null);
+  if (text === null) {
+    process.stderr.write(`gateway config ${configPath} is unreadable\n`);
+    return 2;
+  }
+  const loaded = readGatewayConfig(text, configPath, (name) => process.env[name]);
+  for (const diagnostic of loaded.diagnostics) {
+    process.stderr.write(`${diagnostic.subject}: ${diagnostic.message}\n`);
+  }
+  if (loaded.config === null) {
+    process.stderr.write(`gateway config ${configPath} is not enforceable; refusing to start\n`);
+    return 2;
+  }
+  const config = loaded.config;
+  const handle = await createGateway(config, (name) => process.env[name]);
+  await handle.listen();
+  await new Promise<void>((resolve) => {
+    const shutdown = (): void => {
+      process.off("SIGINT", shutdown);
+      process.off("SIGTERM", shutdown);
+      handle.close().then(resolve, resolve);
+    };
+    handle.server.on("error", (error: Error) => {
+      process.stderr.write(`gateway server error: ${error.message}\n`);
+      shutdown();
+    });
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+    process.stdout.write(`rulehouse gateway listening on ${handle.url}${config.listen.path} (ledger: ${config.ledgerPath})\n`);
+  });
+  return 0;
+}
+
+async function commandLedger(pathArg: string | undefined): Promise<number> {
+  if (pathArg === undefined) {
+    process.stderr.write("ledger requires <file.jsonl>\n");
+    return 2;
+  }
+  const verification = await verifyLedger(pathArg);
+  if (verification.ok) {
+    process.stdout.write(`${pathArg}: chain intact across ${verification.entries} entr${verification.entries === 1 ? "y" : "ies"}\n`);
+    return 0;
+  }
+  process.stderr.write(`${pathArg}: BROKEN at entry ${verification.breakAt}: ${verification.problem}\n`);
+  return 1;
+}
+
 export async function main(argv: readonly string[]): Promise<number> {
   const commandLine = parseCommandLine(argv);
   if (commandLine === null) {
@@ -210,6 +269,10 @@ export async function main(argv: readonly string[]): Promise<number> {
       return await commandDiff(commandLine);
     case "verify":
       return await commandVerify(commandLine);
+    case "serve":
+      return await commandServe(commandLine);
+    case "ledger":
+      return await commandLedger(commandLine.positional[0]);
     case "help":
     case "--help":
     case "-h":

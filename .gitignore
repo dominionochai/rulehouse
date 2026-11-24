@@ -160,3 +160,4 @@ vite.config.ts.timestamp-*
 dist/
 dist-test/
 rulehouse-out/
+rulehouse-gateway-ledger.jsonl

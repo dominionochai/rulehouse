@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { main } from "../src/cli.js";
+import { LedgerWriter } from "../src/gateway/ledger.js";
+import { writeFileSync } from "node:fs";
 
 const REPO = join(fileURLToPath(new URL(".", import.meta.url)), "..", "..");
 const FLEET = join(REPO, "examples", "fleet");
@@ -12,16 +14,20 @@ const DRIFT = join(REPO, "examples", "fleet-drift-after");
 
 async function withTempScan(inplace: string, command: readonly string[]) {
   const originalStdout = process.stdout.write.bind(process.stdout);
+  const originalStderr = process.stderr.write.bind(process.stderr);
   const collected: string[] = [];
-  process.stdout.write = ((chunk: string | Uint8Array) => {
+  const collect = (chunk: string | Uint8Array): true => {
     collected.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
     return true;
-  }) as typeof process.stdout.write;
+  };
+  process.stdout.write = collect as typeof process.stdout.write;
+  process.stderr.write = collect as typeof process.stderr.write;
   try {
     const code = await main(command);
     return { code, stdout: collected.join("") };
   } finally {
     process.stdout.write = originalStdout;
+    process.stderr.write = originalStderr;
   }
 }
 
@@ -40,6 +46,49 @@ test("scan inventories the fleet, writes outputs, and exits 0 without --strict",
     assert.ok(report.verdicts.length > 0);
     assert.ok(markdown.includes("## Evidence"));
     assert.ok(!markdown.includes("RHO-SYNTHETIC-TOKEN-0002"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ledger verification exits 0 on an intact chain and 1 at the first falsified entry", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "rulehouse-cli-"));
+  try {
+    const path = join(dir, "ledger.jsonl");
+    const writer = await LedgerWriter.open(path);
+    await writer.append({
+      decisionId: "sha256:" + "1".repeat(64),
+      identity: "amara",
+      method: "tools/call",
+      tool: "get_issue",
+      decision: { kind: "allowed", ruleId: "RH-GW-READ", reason: "read" },
+      enforcement: "forwarded-to-upstream",
+      upstreamStatus: 200,
+    }, "2026-01-01T00:00:00.000Z");
+
+    const intact = await withTempScan(path, ["ledger", path]);
+    assert.equal(intact.code, 0);
+    assert.ok(intact.stdout.includes("chain intact"));
+
+    const lines = (await readFile(path, "utf8")).split("\n").filter((line) => line.length > 0);
+    const falsified = lines.map((line) => line.replace("get_issue", "delete_issue"));
+    writeFileSync(path, falsified.join("\n") + "\n", "utf8");
+    const broken = await withTempScan(path, ["ledger", path]);
+    assert.equal(broken.code, 1);
+    assert.ok(broken.stdout.includes("BROKEN at entry 0"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("serve refuses an unenforceable gateway config with exit 2", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "rulehouse-cli-"));
+  try {
+    const path = join(dir, "gateway.json");
+    writeFileSync(path, JSON.stringify({ listen: { host: "0.0.0.0" } }), "utf8");
+    const result = await withTempScan(path, ["serve", "--config", path]);
+    assert.equal(result.code, 2);
+    assert.ok(result.stdout.includes("/upstream"), "the refusal names the first missing section");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

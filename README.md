@@ -1,12 +1,18 @@
 # Rulehouse — Continuous Assurance
 
 Rulehouse is an enterprise security control plane for governing how
-AI-connected systems access organizational information. This repository
-currently contains the **Phase-1 Continuous Assurance prototype**: a
-zero-dependency scanner that inventories Atlassian MCP client
-configurations, evaluates a defined policy set against them, detects
-configuration drift, and produces evidence another engineer can
-independently verify.
+AI-connected systems access organizational information. The repository
+contains two working phases:
+
+- **Phase 1 — Continuous Assurance**: a zero-dependency scanner that
+  inventories Atlassian MCP client configurations, evaluates a defined
+  policy set, detects configuration drift, and produces evidence another
+  engineer can independently verify.
+- **Phase 2 — MCP gateway (prototype)**: a policy-enforcing proxy that
+  sits between MCP clients and an upstream server, authenticates each
+  client to an identity, evaluates tool policy, blocks disallowed tool
+  calls **before execution**, and records every decision in a
+  tamper-evident hash-chained ledger.
 
 **Scope honesty, up front.** Continuous Assurance discovers and verifies
 configuration. It does not intercept, mediate, or enforce anything: a
@@ -48,7 +54,66 @@ node dist/index.js diff /tmp/rh-baseline/snapshot.json /tmp/rh-current/snapshot.
 node dist/index.js verify /tmp/rh-baseline/snapshot.json --root examples/fleet
 ```
 
-## Commands and exit codes
+## The MCP gateway (Phase 2)
+
+The gateway is the Phase-2 enforcement point from the product brief: it
+mediates MCP traffic between clients and an upstream server (e.g.
+`https://mcp.atlassian.com/v2/mcp`) at the HTTP boundary.
+
+What it establishes, each anchored to a test:
+
+- **Identity handling** — clients authenticate to the gateway with a
+  bearer key; only the key's SHA-256 digest is configured, and the
+  gateway forwards *its own* upstream credential upstream, never the
+  client's key.
+- **Attribution** — every mediated request produces a ledger record
+  carrying the authenticated identity, the method, the tool, the
+  decision, the rule that produced it, and the enforcement result.
+- **Policy evaluation** — declarative first-match-wins rules
+  (`get_*`, `delete_*`, …) per identity with a configurable default
+  effect (default: deny).
+- **Pre-execution enforcement** — a denied tool call never reaches the
+  upstream; the mock-upstream tests assert request counts to prove the
+  block actually happened at the boundary.
+- **Approval requirements** — a rule can mark calls as
+  `approval: "required"`; they deny until their derived decision id is
+  listed in the approvals file. Decision ids are deterministic (hash of
+  identity + method + tool + arguments), so an operator's grant matches
+  a client retry byte-for-byte, and revoking the line re-blocks
+  immediately — the file is re-read per request.
+- **Decision ledger** — an append-only JSONL file where each entry
+  hashes its content and links to the previous entry's hash;
+  `rulehouse ledger <file>` verifies the chain, and any edit, deletion,
+  or reordering is reported at the first broken entry.
+
+Run it (example config in `examples/gateway/`; binds loopback only):
+
+```sh
+node dist/index.js serve --config examples/gateway/rulehouse-gateway.jsonc
+node dist/index.js ledger rulehouse-gateway-ledger.jsonl
+```
+
+**Attribution honesty.** The ledger records the identity the gateway
+authenticated, i.e. decision-grade attribution for requests it mediates.
+It does not claim to change or repair Atlassian's native audit records.
+
+**Prototype limits, stated as limits.** Requests are forwarded
+byte-for-byte over stateless HTTP POST (JSON mode); SSE-streamed MCP
+sessions and body rewriting are not implemented. There is no TLS — the
+config loader refuses any non-loopback bind and remote deployments must
+sit behind a TLS-terminating proxy. An unreachable upstream fails
+closed: the operation is not executed and the failure is recorded as
+`failed-forwarding`, which the ledger keeps distinct from both
+`blocked-at-gateway` and `forwarded-to-upstream`.
+
+## Phase-1 scanner
+
+The Continuous Assurance side of the tool: point `scan` at a directory
+tree of MCP client configurations and it produces verifiable inventory,
+policy and drift evidence without ever running anything against the
+upstream servers.
+
+### Commands and exit codes
 
 | Command | Purpose | Exit codes |
 | --- | --- | --- |
@@ -59,7 +124,7 @@ node dist/index.js verify /tmp/rh-baseline/snapshot.json --root examples/fleet
 Usage errors and tampering are distinct exits (`2` vs `1`) so CI can
 separate "the tool was misused" from "the evidence disagrees".
 
-## What scan actually checks
+### What scan actually checks
 
 Policies are declarative tables in `src/policy.ts`. Per registration:
 
@@ -85,7 +150,7 @@ Across registrations of the same server:
 Passes and `not-applicable` verdicts are recorded alongside findings.
 Silence proves nothing; the report shows the checks that ran and passed.
 
-## Secrets policy
+### Secrets policy
 
 Credentials found in configurations are **fingerprinted at parse time**
 into a `SecretFingerprint` (`sha256:<16-hex prefix>` plus structural
@@ -95,7 +160,7 @@ never appear in any serialized output. Attribution usernames (which are
 Atlassian account emails, i.e. evidence, not secrets) and SHA-256 input
 hashes are retained.
 
-## Evidence chain
+### Evidence chain
 
 Every scan hashes each input file (SHA-256 of the exact bytes, comments
 and all) and computes a canonical fingerprint over
@@ -109,7 +174,7 @@ and all) and computes a canonical fingerprint over
 - Tampering with a snapshot is audible: the recomputed fingerprint no
   longer matches the stored one.
 
-## Supported configuration formats
+### Supported configuration formats
 
 - `claude_desktop_config.json` (Claude Desktop, `mcpServers`)
 - `.mcp.json` (Claude Code, `mcpServers`)
@@ -128,12 +193,13 @@ npm run check        # typecheck + full test suite
 npm test             # tests run via node:test against compiled output
 ```
 
-## Non-goals of this prototype
+## Non-goals
 
-- No enforcement or mediation (Phase 2 gateway).
 - No native Rovo interception claims — none exists without an
   Atlassian-supported control point.
 - No universal shadow-MCP discovery — only explicitly registered
   client configurations on disk are inventoried.
 - No A2A governance — deferred until its enforcement architecture is
   validated.
+- No chat interface, no model training, no replacement for Atlassian's
+  identity or permission system.

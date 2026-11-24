@@ -14,6 +14,17 @@ export type Json =
   | readonly Json[]
   | { readonly [key: string]: Json };
 
+export type JsonObject = { readonly [key: string]: Json };
+
+/**
+ * Runtime type guard for the object arm of `Json`. Array.isArray alone does
+ * not narrow `readonly Json[]` out of the union, so the parser path uses this
+ * guard everywhere it needs indexed access.
+ */
+export function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export interface ParseDiagnostic {
   readonly source: string;
   readonly message: string;

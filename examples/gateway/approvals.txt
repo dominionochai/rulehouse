@@ -1,0 +1,3 @@
+# Rulehouse gateway approvals: one decision id per line.
+# Approval is stateless: the gateway re-reads this file per request, so
+# revoking a line takes effect immediately.

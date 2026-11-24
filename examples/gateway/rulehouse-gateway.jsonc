@@ -1,0 +1,30 @@
+// Rulehouse MCP gateway configuration.
+//
+// Client keys: identities authenticate to the gateway with a bearer key; only
+// its full SHA-256 digest is configured here. To register a key:
+//   printf '%s' "<key>" | sha256sum
+//
+// The upstream credential is read from the environment at startup and is
+// never written to disk or logs by the gateway.
+{
+  "listen": { "host": "127.0.0.1", "port": 8080, "path": "/mcp" },
+  "upstream": {
+    "url": "https://mcp.atlassian.com/v2/mcp",
+    "credentialEnv": "ATLASSIAN_SERVICE_KEY",
+    "credentialScheme": "basic"
+  },
+  "identities": [
+    { "name": "amara", "kind": "user", "keyHash": "sha256:4668394217a24a1c5914795245de61547d5ff1d331bb487901815b74dd471533" },
+    { "name": "runbook-agent", "kind": "agent", "keyHash": "sha256:bbcb7ee72e6737204641e124c11267293a04ab25e055d73b84c66126929a747d" }
+  ],
+  "policies": {
+    "defaultEffect": "deny",
+    "rules": [
+      { "id": "RH-GW-READ", "identities": null, "tools": ["get_*", "search_*", "list_*"], "effect": "allow" },
+      { "id": "RH-GW-MUTATE-APPROVED", "identities": ["amara"], "tools": ["update_*", "create_*"], "effect": "allow", "approval": "required" },
+      { "id": "RH-GW-NO-DELETE", "identities": null, "tools": ["delete_*"], "effect": "deny" }
+    ]
+  },
+  "ledger": { "path": "rulehouse-gateway-ledger.jsonl" },
+  "approvals": { "path": "examples/gateway/approvals.txt" }
+}
