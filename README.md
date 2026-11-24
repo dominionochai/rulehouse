@@ -2,7 +2,7 @@
 
 Rulehouse is an enterprise security control plane for governing how
 AI-connected systems access organizational information. The repository
-contains two working phases:
+contains four working phases:
 
 - **Phase 1 — Continuous Assurance**: a zero-dependency scanner that
   inventories Atlassian MCP client configurations, evaluates a defined
@@ -17,6 +17,11 @@ contains two working phases:
   content-trust registry and policy conditions that stop content of
   declared untrusted provenance from independently driving privileged
   tool calls on mediated paths.
+- **Phase 4 — A2A delegation governance (engineering primitives)**:
+  validation of A2A agent cards against the frozen v1.0 spec facts, and a
+  delegation registry whose decisions are computed by the same policy
+  engine as direct calls — a delegatee can never exceed its delegator
+  because there is no separate delegation policy to drift.
 
 **Scope honesty, up front.** Continuous Assurance discovers and verifies
 configuration. It does not intercept, mediate, or enforce anything: a
@@ -165,6 +170,110 @@ close an egress path that an adjacent capability still reaches. The
 correct posture — narrow product claim, detection and reporting only
 where telemetry permits — is retained rather than marketed over.
 
+## A2A delegation governance (Phase 4)
+
+Phase 4 answers the brief's deferred capability -- agent-to-agent
+delegation, trust, permission inheritance, revocation, and audit trails --
+as validated engineering primitives, and it is deliberate about what it
+does not claim: **Rulehouse evaluates delegation decisions; it does not
+intercept A2A traffic.** Mediating agent-to-agent calls requires a
+validated control point (a gateway, a broker, or a platform-supported
+hook), and none is proven yet. What ships here is the decision core that
+such a control point would one day call, exercised end to end by the CLI.
+
+### Agent card validation
+
+Every A2A server publishes an agent card -- the discovery document that
+says who an agent is, where it is reachable, and what it can do. `a2a
+validate` checks a card (file or stdin) against the published v1.0 conformance
+facts: required identity fields (`name`, `description`, the agent release
+`version`, and `protocolVersion`); the v1.0 `supportedInterfaces` array
+with its binding names, while tolerating the legacy v0.x single `url`
+shape (Atlassian's Rovo card still serves that, at
+`https://a2a.atlassian.com/.well-known/agent.json`); boolean
+`capabilities`; the required `id`/`name`/`description`/`tags` skill
+fields; security-scheme references that actually resolve; and signature
+coverage. Defects are reported one by one as findings instead of discarding
+the whole card, and a broken entry never poisons its siblings:
+
+```sh
+node dist/index.js a2a validate examples/a2a/agent-card.json
+node dist/index.js a2a validate examples/a2a/rovo-agent-card.json
+```
+
+Note what validation does *not* claim: signature *verification* (JWS over
+the RFC 8785 canonical card) needs key discovery that no validated
+integration point provides yet, so cards are reported signed/unsigned and
+structurally sound or not -- never "authentic".
+
+### Delegation without a second policy language
+
+The delegation registry records two record kinds -- `grant` and
+`revocation` -- on the same append-only hash chain as the decision ledger
+and the provenance registry. Grant ids are content-addressed: re-derived
+from the grant's own fields and checked against the file on every read,
+so a grant cannot present itself under an id its content does not own,
+and re-granting after revocation is a visibly new issuance, not a
+resurrection.
+
+The security core is what the registry does *not* contain: no delegation
+policy file. When a delegated call is evaluated, the existing gateway
+policies are executed once per identity on the grant chain -- the acting
+agent, then each delegator up to the root -- against the same tool and
+the same arguments:
+
+- a delegatee can never exceed its delegator, because the delegator's own
+  rules deny the call directly;
+- approval requirements escalate: if any ceiling requires human approval,
+  the delegated call requires human approval, even where the agent's own
+  rule does not;
+- provenance conditions compose: an untrusted argument is still denied at
+  the ceiling, not waved through by delegation;
+- revocation cascades for free: a chain is only as valid as every grant
+  on it, so revoking one upstream grant kills every downstream
+  presentation without any cascading logic;
+- cycles (A acts for B while B acts for A) are refused by construction;
+- expiry is anchored to an explicit evaluation instant; and
+- every refusal names its exact defect -- unknown grant, revoked,
+  disconnected chain, cycle, expiry, out-of-scope tool, or the ceiling
+  that denied -- because an audit that cannot explain itself cannot be
+  defended.
+
+Govern the chain from the CLI:
+
+```sh
+node dist/index.js a2a delegate examples/a2a/delegations.jsonl \
+  --from amara --to runbook-agent --tools "search_*,get_*,list_*" \
+  --granted-by secops
+node dist/index.js a2a inspect examples/a2a/delegations.jsonl
+node dist/index.js a2a revoke examples/a2a/delegations.jsonl <grantId> --revoked-by secops
+```
+
+And evaluate a delegated call offline against the same gateway
+configuration the live gateway enforces (`a2a simulate`). The example
+registry contains a standing grant of read authority from `amara` to
+`runbook-agent`; the simulate output is a full decision artifact -- chain,
+per-ceiling rule decisions, provenance facts -- ready to be quoted as
+evidence:
+
+```sh
+node dist/index.js a2a simulate examples/a2a/delegations.jsonl \
+  --config examples/gateway/rulehouse-gateway.jsonc \
+  --identity runbook-agent --tool get_issue \
+  --via delegation:716eebecf9c03483db98c784ce78a48836e287b4601fdcf83270b9deac308955
+```
+
+### Phase-4 honesty
+
+- Interception of A2A traffic itself remains an explicit non-claim until a
+  control point is demonstrated; the primitives here are the evaluated
+  decision core, not a mediator.
+- Agent-card signature verification is structural only; JWS verification
+  awaits a validated key-distribution path.
+- The `now` used for expiry is pinned per invocation (`--now`), which
+  makes decisions reproducible -- and means callers must pass a real
+  clock in production integrations.
+
 ## Phase-1 scanner
 
 The Continuous Assurance side of the tool: point `scan` at a directory
@@ -258,7 +367,8 @@ npm test             # tests run via node:test against compiled output
   Atlassian-supported control point.
 - No universal shadow-MCP discovery — only explicitly registered
   client configurations on disk are inventoried.
-- No A2A governance — deferred until its enforcement architecture is
-  validated.
+- No A2A traffic interception — delegation governance ships as
+  evaluated primitives (Phase 4); mediating A2A calls waits for a
+  demonstrated control point.
 - No chat interface, no model training, no replacement for Atlassian's
   identity or permission system.

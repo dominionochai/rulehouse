@@ -237,3 +237,130 @@ test("provenance inspect reports unclassified for unknown content, and register 
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("a2a validate accepts a conforming card file and pinpoints defects otherwise", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "rulehouse-a2a-"));
+  try {
+    const cardPath = join(dir, "card.json");
+    await writeFile(cardPath, JSON.stringify({
+      name: "Ops Agent",
+      description: "Runs runbook procedures.",
+      version: "1.0.0",
+      protocolVersion: "1.0",
+      supportedInterfaces: [{ url: "https://agents.example.internal/a2a", protocolBinding: "JSONRPC", protocolVersion: "1.0" }],
+      capabilities: { streaming: true, pushNotifications: false, stateTransitionHistory: true },
+      skills: [{ id: "runbook", name: "Runbook", description: "Executes a runbook.", tags: ["jira"] }],
+      signatures: [{ protected: "b64header", signature: "b64sig" }],
+    }, null, 2));
+    const clean = await withTempScan(dir, ["a2a", "validate", cardPath]);
+    assert.equal(clean.code, 0);
+    assert.match(clean.stdout, /Ops Agent v1\.0\.0 \(protocol 1\.0, v1\)/);
+
+    const unsigned = JSON.parse(await readFile(cardPath, "utf8"));
+    delete unsigned.signatures;
+    await writeFile(cardPath, JSON.stringify(unsigned, null, 2));
+    const flagged = await withTempScan(dir, ["a2a", "validate", cardPath]);
+    assert.equal(flagged.code, 1, "an unsigned card validates only with a finding: its authenticity rests on the retrieval channel");
+    assert.match(flagged.stdout, /FINDING \/a2a-card\/signatures/);
+
+    await writeFile(cardPath, JSON.stringify({ name: "Ops Agent" }));
+    const broken = await withTempScan(dir, ["a2a", "validate", cardPath]);
+    assert.equal(broken.code, 1);
+    assert.match(broken.stdout, /\/a2a-card\/description/);
+
+    const unreadable = await withTempScan(dir, ["a2a", "validate", join(dir, "absent.json")]);
+    assert.equal(unreadable.code, 2);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a2a delegate, inspect, and revoke round-trip through a verified registry", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "rulehouse-a2a-"));
+  try {
+    const registryPath = join(dir, "delegations.jsonl");
+    const granted = await withTempScan(dir, ["a2a", "delegate", registryPath,
+      "--from", "amara", "--to", "runbook-agent", "--tools", "search_*, get_*", "--granted-by", "secops"]);
+    assert.equal(granted.code, 0);
+    const grantId = /grant (delegation:[0-9a-f]{64})/.exec(granted.stdout)?.[1];
+    assert.ok(grantId, "the grant id is reported so it can be revoked by name");
+    assert.match(granted.stdout, /granted authority of amara over tools search_\*, get_\* to runbook-agent/);
+
+    const chain = await withTempScan(dir, ["ledger", registryPath]);
+    assert.equal(chain.code, 0, "the delegation registry is a verifiable rulehouse chain");
+
+    const inspected = await withTempScan(dir, ["a2a", "inspect", registryPath]);
+    assert.equal(inspected.code, 0);
+    assert.match(inspected.stdout, new RegExp(grantId!.slice(0, 24)));
+    assert.match(inspected.stdout, /amara -> runbook-agent scope: search_\*, get_\*/);
+    assert.match(inspected.stdout, /active/);
+
+    const selfRevoke = await withTempScan(dir, ["a2a", "revoke", registryPath, grantId!, "--revoked-by", "secops"]);
+    assert.equal(selfRevoke.code, 0);
+    const after = await withTempScan(dir, ["a2a", "inspect", registryPath]);
+    assert.match(after.stdout, /REVOKED by secops/);
+
+    const unknown = await withTempScan(dir, ["a2a", "revoke", registryPath, `delegation:${"0".repeat(64)}`, "--revoked-by", "secops"]);
+    assert.equal(unknown.code, 1, "only an actual issuance can be revoked");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a2a delegate refuses to append to a tampered registry", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "rulehouse-a2a-"));
+  try {
+    const registryPath = join(dir, "delegations.jsonl");
+    await withTempScan(dir, ["a2a", "delegate", registryPath,
+      "--from", "amara", "--to", "runbook-agent", "--tools", "search_*", "--granted-by", "secops"]);
+    const intact = await readFile(registryPath, "utf8");
+    await writeFile(registryPath, intact.replace('"delegatee":"runbook-agent"', '"delegatee":"attacker-agent"'), "utf8");
+    const refused = await withTempScan(dir, ["a2a", "delegate", registryPath,
+      "--from", "amara", "--to", "runbook-agent", "--tools", "search_*", "--granted-by", "secops"]);
+    assert.equal(refused.code, 1);
+    assert.match(refused.stdout, /refusing to append/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a2a simulate evaluates a delegated call against real gateway policies", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "rulehouse-a2a-"));
+  try {
+    const configPath = join(dir, "gateway.jsonc");
+    await writeFile(configPath, JSON.stringify({
+      upstream: { url: "https://mcp.atlassian.com/v2/mcp", credentialEnv: "ATLASSIAN_SERVICE_KEY", credentialScheme: "basic" },
+      identities: [
+        { name: "amara", kind: "user", keyHash: "sha256:4668394217a24a1c5914795245de61547d5ff1d331bb487901815b74dd471533" },
+        { name: "runbook-agent", kind: "agent", keyHash: "sha256:bbcb7ee72e6737204641e124c11267293a04ab25e055d73b84c66126929a747d" },
+      ],
+      policies: {
+        defaultEffect: "deny",
+        rules: [{ id: "RH-GW-READ", identities: null, tools: ["get_*", "search_*"], effect: "allow" }],
+      },
+    }, null, 2));
+    const registryPath = join(dir, "delegations.jsonl");
+    const granted = await withTempScan(dir, ["a2a", "delegate", registryPath,
+      "--from", "amara", "--to", "runbook-agent", "--tools", "search_*", "--granted-by", "secops"]);
+    const grantId = /grant (delegation:[0-9a-f]{64})/.exec(granted.stdout)?.[1];
+    assert.ok(grantId);
+
+    const allowed = await withTempScan(dir, ["a2a", "simulate", registryPath, "--config", configPath,
+      "--identity", "runbook-agent", "--tool", "search_pages", "--via", grantId!]);
+    assert.equal(allowed.code, 0);
+    const rendered = JSON.parse(allowed.stdout);
+    assert.equal(rendered.allowed, true);
+    assert.deepEqual(rendered.ceilings.map((c: { identity: string }) => c.identity), ["runbook-agent", "amara"]);
+
+    const uncompensated = await withTempScan(dir, ["a2a", "simulate", registryPath, "--config", configPath,
+      "--identity", "attacker-agent", "--tool", "search_pages", "--via", grantId!]);
+    assert.equal(uncompensated.code, 1, "a grant cannot be presented by an identity it does not name");
+
+    const bare = await withTempScan(dir, ["a2a", "simulate", registryPath, "--config", configPath,
+      "--identity", "runbook-agent", "--tool", "search_pages", "--now", "2026-08-01T00:00:00.000Z"]);
+    assert.equal(bare.code, 1, "without a presented grant there is nothing to govern");
+    assert.match(bare.stdout, /no delegation presented/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

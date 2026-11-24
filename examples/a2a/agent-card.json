@@ -1,0 +1,31 @@
+{
+  "name": "Runbook Coordinator",
+  "description": "Coordinates runbook execution across Jira and Confluence for the platform team.",
+  "version": "2.4.1",
+  "protocolVersion": "1.0",
+  "provider": { "organization": "Platform Engineering", "url": "https://platform.example.internal" },
+  "documentationUrl": "https://docs.example.internal/runbook-coordinator",
+  "supportedInterfaces": [
+    { "url": "https://agents.example.internal/a2a/rpc", "protocolBinding": "JSONRPC", "protocolVersion": "1.0" },
+    { "url": "https://agents.example.internal/a2a/rest", "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0" }
+  ],
+  "capabilities": { "streaming": true, "pushNotifications": false, "stateTransitionHistory": true },
+  "skills": [
+    {
+      "id": "runbook-execute",
+      "name": "Execute runbook",
+      "description": "Applies an approved runbook procedure to a flagged incident.",
+      "tags": ["jira", "runbook", "automation"],
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    },
+    {
+      "id": "incident-summary",
+      "name": "Summarize incident",
+      "description": "Reads a Jira incident and produces a structured summary.",
+      "tags": ["jira", "summarization"]
+    }
+  ],
+  "securitySchemes": { "oauth2": { "type": "oauth2" } },
+  "security": [{ "oauth2": ["read:issues", "read:pages"] }]
+}

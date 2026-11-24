@@ -1,0 +1,14 @@
+{
+  "name": "Atlassian Rovo",
+  "description": "Rovo agent-to-agent interface for Jira and Confluence work.",
+  "version": "1.0.0",
+  "protocolVersion": "0.3.0",
+  "url": "https://a2a.atlassian.com/v1/rovo",
+  "capabilities": { "streaming": true, "pushNotifications": false },
+  "skills": [
+    { "id": "work-in-jira", "name": "Work in Jira", "description": "Read and act on Jira issues on the user's behalf.", "tags": ["jira"] },
+    { "id": "work-in-confluence", "name": "Work in Confluence", "description": "Read and act on Confluence spaces and pages.", "tags": ["confluence"] }
+  ],
+  "securitySchemes": { "oauth2": { "type": "oauth2" } },
+  "security": [{ "oauth2": ["read:jira-work", "read:confluence-content.summary"] }]
+}

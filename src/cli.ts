@@ -1,6 +1,17 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { appendProvenanceRecord, contentDigestOfText, readProvenanceRegistry,
   type ProvenanceOrigin, type ProvenanceTrust } from "./provenance.js";
+import { validateAgentCard } from "./a2a/card.js";
+import {
+  appendDelegationRecord,
+  evaluateDelegatedToolCall,
+  grantIdOf,
+  readDelegationRegistry,
+  type DelegatedDecision,
+  type DelegationGrant,
+  type DelegationRecord,
+} from "./a2a/delegation.js";
+import { isJsonObject, type JsonObject } from "./lib/json.js";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { diffSnapshots, type SnapshotDiff } from "./diff.js";
@@ -21,7 +32,7 @@ interface CommandLine {
   readonly flags: ReadonlyMap<string, string | true>;
 }
 
-const FLAG_WITH_VALUE = new Set(["--allowlist", "--config", "--out", "--root", "--origin", "--trust", "--source", "--labeled-by"]);
+const FLAG_WITH_VALUE = new Set(["--allowlist", "--config", "--out", "--root", "--origin", "--trust", "--source", "--labeled-by", "--from", "--to", "--tools", "--granted-by", "--expires-at", "--revoked-by", "--grant", "--tool", "--identity", "--arguments", "--via", "--now"]);
 
 function parseCommandLine(argv: readonly string[]): CommandLine | null {
   if (argv.length === 0) return null;
@@ -57,6 +68,11 @@ Usage:
   rulehouse ledger <file.jsonl>
   rulehouse provenance register <registry.jsonl> <file> --origin <o> --trust <t> --source <label> --labeled-by <who>
   rulehouse provenance inspect <registry.jsonl> <file>
+  rulehouse a2a validate <card.json|->
+  rulehouse a2a delegate <registry.jsonl> --from <delegator> --to <delegatee> --tools <csv> --granted-by <who> [--expires-at <iso>]
+  rulehouse a2a revoke <registry.jsonl> <grantId> --revoked-by <who>
+  rulehouse a2a inspect <registry.jsonl> [--grant <id>]
+  rulehouse a2a simulate <registry.jsonl> --config <gateway config> --identity <name> --tool <tool> [--arguments <json object>] [--via <grantId,...>] [--now <iso>]
   rulehouse help
 
 Commands:
@@ -77,6 +93,14 @@ Commands:
            grants effect when the named argument's content resolves to an
            accepted declared trust. Re-registering a digest supersedes the
            previous record; the chain keeps the full history.
+  a2a      Validate A2A agent cards, and govern delegation of authority
+           between identities: grants, revocations, and offline evaluation of
+           a delegated tool call. A delegated call is allowed only when every
+           identity on the grant chain -- the acting agent and each delegator
+           up to the root -- is allowed by its own existing gateway policies,
+           so a delegatee can never exceed its delegator. This evaluates
+           delegation decisions; it does not intercept A2A traffic, which
+           requires a validated control point.
 
 Credentials are never emitted: configuration secrets are stored only as
 SHA-256 fingerprint prefixes.
@@ -346,6 +370,227 @@ async function commandProvenance(options: CommandLine): Promise<number> {
   return 0;
 }
 
+async function commandA2a(options: CommandLine): Promise<number> {
+  const verb = options.positional[0];
+  switch (verb) {
+    case "validate":
+      return await a2aValidate(options.positional[1]);
+    case "delegate":
+      return await a2aDelegate(options);
+    case "revoke":
+      return await a2aRevoke(options);
+    case "inspect":
+      return await a2aInspect(options);
+    case "simulate":
+      return await a2aSimulate(options);
+    default:
+      process.stderr.write('a2a requires a verb: "validate", "delegate", "revoke", "inspect", or "simulate"\n');
+      return 2;
+  }
+}
+
+function flagValueOf(options: CommandLine, name: string): string | null {
+  const value = options.flags.get(name);
+  return typeof value === "string" ? value : null;
+}
+
+async function a2aValidate(pathArg: string | undefined): Promise<number> {
+  const text = await readContentSource(pathArg);
+  if (text === null) {
+    process.stderr.write(`a2a validate could not read ${pathArg ?? "(missing)"}; use "-" for stdin\n`);
+    return 2;
+  }
+  const source = pathArg === undefined || pathArg === "-" ? "<stdin>" : pathArg;
+  const { card, diagnostics } = validateAgentCard(text, source);
+  for (const diagnostic of diagnostics) {
+    process.stdout.write(`FINDING ${diagnostic.subject}: ${diagnostic.message}\n`);
+  }
+  if (card === null) {
+    process.stderr.write(`${source} is not a usable agent card\n`);
+    return 1;
+  }
+  const enabled = Object.entries(card.capabilities).filter(([, on]) => on).map(([field]) => field);
+  process.stdout.write(`${source}: ${card.name} v${card.version} (protocol ${card.protocolVersion}, ${card.protocolMajor < 1 ? "legacy" : "v1"})\n`);
+  for (const iface of card.interfaces) {
+    process.stdout.write(`  interface ${iface.protocolBinding} ${iface.url}${iface.protocolVersion === null ? "" : ` (protocol ${iface.protocolVersion})`}\n`);
+  }
+  process.stdout.write(`  capabilities: ${enabled.length === 0 ? "none declared" : enabled.join(", ")}\n`);
+  process.stdout.write(`  skills: ${card.skills.length}; security schemes: ${card.securitySchemes.length === 0 ? "none" : card.securitySchemes.join(", ")}; signed: ${card.signed ? "yes" : "no"}\n`);
+  return diagnostics.length === 0 ? 0 : 1;
+}
+
+async function a2aDelegate(options: CommandLine): Promise<number> {
+  const registryPath = options.positional[1];
+  const from = flagValueOf(options, "--from");
+  const to = flagValueOf(options, "--to");
+  const toolsRaw = flagValueOf(options, "--tools");
+  const grantedBy = flagValueOf(options, "--granted-by");
+  const expiresAt = flagValueOf(options, "--expires-at");
+  if (typeof registryPath !== "string" || from === null || to === null || toolsRaw === null || grantedBy === null
+    || from.length === 0 || to.length === 0 || grantedBy.length === 0) {
+    process.stderr.write("a2a delegate requires <registry.jsonl> --from <delegator> --to <delegatee> --tools <csv> --granted-by <who>\n");
+    return 2;
+  }
+  const tools = toolsRaw.split(",").map((tool) => tool.trim()).filter((tool) => tool.length > 0);
+  if (tools.length === 0) {
+    process.stderr.write("--tools must name at least one tool pattern\n");
+    return 2;
+  }
+  if (from === to) {
+    process.stderr.write("a delegation from an identity to itself is a cycle and governs nothing\n");
+    return 2;
+  }
+  if (expiresAt !== null && !Number.isFinite(Date.parse(expiresAt))) {
+    process.stderr.write(`--expires-at must be an ISO timestamp, got "${expiresAt}"\n`);
+    return 2;
+  }
+  const grantedAt = new Date().toISOString();
+  const grant: Omit<DelegationGrant, "grantId"> = { delegator: from, delegatee: to, tools, grantedBy, grantedAt, expiresAt };
+  return await appendGovernedRecord(registryPath, { kind: "grant", grantId: grantIdOf(grant), ...grant },
+    `granted ${describeGrant(grant)}`);
+}
+
+function describeGrant(grant: Omit<DelegationGrant, "grantId">): string {
+  return `authority of ${grant.delegator} over tools ${grant.tools.join(", ")} to ${grant.delegatee}`;
+}
+
+async function a2aRevoke(options: CommandLine): Promise<number> {
+  const registryPath = options.positional[1];
+  const grantId = options.positional[2];
+  const revokedBy = flagValueOf(options, "--revoked-by");
+  if (typeof registryPath !== "string" || typeof grantId !== "string" || revokedBy === null || revokedBy.length === 0) {
+    process.stderr.write("a2a revoke requires <registry.jsonl> <grantId> --revoked-by <who>\n");
+    return 2;
+  }
+  const registry = await readDelegationRegistry(registryPath);
+  if (registry.corrupt !== null) {
+    process.stderr.write(`${registryPath}: refusing to append; the chain is broken: ${registry.corrupt}\n`);
+    return 1;
+  }
+  if (!registry.grants.has(grantId)) {
+    process.stderr.write(`${registryPath}: no grant ${grantId}; revoke names an issuance, and only issuances can be revoked\n`);
+    return 1;
+  }
+  return await appendGovernedRecord(registryPath, { kind: "revocation", grantId, revokedBy },
+    `revoked ${grantId} (by ${revokedBy})`);
+}
+
+/**
+ * Shared tail of both mutations: never append to a chain we cannot prove is
+ * intact -- the Phase-3 lesson is a registry invariant, not a one-off fix.
+ */
+async function appendGovernedRecord(registryPath: string, record: DelegationRecord, description: string): Promise<number> {
+  const integrity = await verifyChain(registryPath);
+  if (!integrity.ok && integrity.problem !== null) {
+    process.stderr.write(`${registryPath}: refusing to append; the chain is broken at entry ${integrity.breakAt}: ${integrity.problem}\n`);
+    return 1;
+  }
+  let seq: number;
+  try {
+    seq = await appendDelegationRecord(registryPath, record, new Date().toISOString());
+  } catch (error) {
+    process.stderr.write(`a2a could not append to ${registryPath}: ${(error as Error).message}\n`);
+    return 2;
+  }
+  process.stdout.write(`${description} (entry ${seq} in ${registryPath}, grant ${record.grantId})\n`);
+  return 0;
+}
+
+async function a2aInspect(options: CommandLine): Promise<number> {
+  const registryPath = options.positional[1];
+  if (typeof registryPath !== "string") {
+    process.stderr.write("a2a inspect requires <registry.jsonl>\n");
+    return 2;
+  }
+  const registry = await readDelegationRegistry(registryPath);
+  if (registry.corrupt !== null) {
+    process.stderr.write(`${registryPath}: BROKEN: ${registry.corrupt}\n`);
+    return 2;
+  }
+  const filter = flagValueOf(options, "--grant");
+  const states = [...registry.grants.entries()]
+    .filter(([id]) => filter === null || id === filter);
+  if (filter !== null && states.length === 0) {
+    process.stderr.write(`${registryPath}: no grant ${filter}\n`);
+    return 1;
+  }
+  for (const [id, state] of states) {
+    const g = state.grant;
+    const status = state.revoked ? `REVOKED by ${state.revokedBy}` : "active";
+    process.stdout.write(`${id}\n  ${g.delegator} -> ${g.delegatee} scope: ${g.tools.join(", ")}\n  granted by ${g.grantedBy} at ${g.grantedAt}; expires: ${g.expiresAt ?? "never"}; ${status}\n`);
+  }
+  if (states.length === 0) process.stdout.write(`${registryPath}: no delegation grants recorded\n`);
+  return 0;
+}
+
+async function a2aSimulate(options: CommandLine): Promise<number> {
+  const registryPath = options.positional[1];
+  const configPath = flagValueOf(options, "--config");
+  const identity = flagValueOf(options, "--identity");
+  const tool = flagValueOf(options, "--tool");
+  const argumentsJson = flagValueOf(options, "--arguments");
+  const viaRaw = flagValueOf(options, "--via");
+  const now = flagValueOf(options, "--now") ?? new Date().toISOString();
+  if (typeof registryPath !== "string" || typeof configPath !== "string" || identity === null || tool === null) {
+    process.stderr.write("a2a simulate requires <registry.jsonl> --config <file> --identity <name> --tool <tool> [--arguments <json object>] [--via <ids>] [--now <iso>]\n");
+    return 2;
+  }
+  let args: JsonObject | null = null;
+  if (argumentsJson !== null) {
+    const parsed: unknown = JSON.parse(argumentsJson);
+    if (!isJsonObject(parsed)) {
+      process.stderr.write("--arguments must be a JSON object of tool arguments\n");
+      return 2;
+    }
+    args = parsed;
+  }
+  const presented = viaRaw === null ? [] : viaRaw.split(",").map((id) => id.trim()).filter((id) => id.length > 0);
+  const configText = await readFile(configPath, "utf8").catch(() => null);
+  if (configText === null) {
+    process.stderr.write(`gateway config ${configPath} is unreadable\n`);
+    return 2;
+  }
+  const loaded = readGatewayConfig(configText, configPath, (name) => process.env[name]);
+  if (loaded.config === null) {
+    for (const diagnostic of loaded.diagnostics) process.stderr.write(`${diagnostic.subject}: ${diagnostic.message}\n`);
+    process.stderr.write(`gateway config ${configPath} is not enforceable; refusing to simulate against it\n`);
+    return 2;
+  }
+  const [delegations, provenance] = await Promise.all([
+    readDelegationRegistry(registryPath),
+    loaded.config.provenancePath === null ? Promise.resolve(null) : readProvenanceRegistry(loaded.config.provenancePath),
+  ]);
+  const decision = evaluateDelegatedToolCall({
+    policies: loaded.config.policies,
+    delegations,
+    presented,
+    identity,
+    tool,
+    args,
+    registry: provenance,
+    now,
+  });
+  process.stdout.write(`${JSON.stringify(renderDelegatedDecision(decision), null, 2)}\n`);
+  return decision.allowed ? 0 : 1;
+}
+
+function renderDelegatedDecision(decision: DelegatedDecision): JsonObject {
+  return {
+    allowed: decision.allowed,
+    approvalRequired: decision.approvalRequired,
+    reason: decision.reason,
+    chain: decision.chain.map((link) => ({ grantId: link.grantId, delegator: link.delegator, delegatee: link.delegatee })),
+    ceilings: decision.ceilings.map((ceiling) => ({
+      identity: ceiling.identity,
+      kind: ceiling.decision.kind,
+      ruleId: ceiling.decision.ruleId,
+      approvalRequired: ceiling.decision.approvalRequired,
+      reason: ceiling.decision.reason,
+    })),
+    provenance: decision.provenance.map((fact) => ({ argument: fact.argument, contentSha256: fact.contentSha256, trust: fact.trust })),
+  };
+}
+
 async function commandLedger(pathArg: string | undefined): Promise<number> {
   if (pathArg === undefined) {
     process.stderr.write("ledger requires <file.jsonl>\n");
@@ -379,6 +624,8 @@ export async function main(argv: readonly string[]): Promise<number> {
       return await commandLedger(commandLine.positional[0]);
     case "provenance":
       return await commandProvenance(commandLine);
+    case "a2a":
+      return await commandA2a(commandLine);
     case "help":
     case "--help":
     case "-h":
