@@ -1,0 +1,23 @@
+{
+  "name": "rulehouse",
+  "version": "0.1.0",
+  "description": "Rulehouse Continuous Assurance — inventory and policy verification for Atlassian MCP configurations.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "rulehouse": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.test.json && node --test --test-reporter=spec dist-test/test/*.test.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check": "npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "typescript": "5.9.3"
+  }
+}

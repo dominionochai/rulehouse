@@ -1,0 +1,16 @@
+{
+  "servers": {
+    "legacy-monitoring": {
+      "type": "http",
+      "url": "http://monitoring.internal.example:3927/mcp"
+    },
+    "wiki-loader": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "wiki-loader-mcp@1.4.0"],
+      "env": {
+        "X-API-KEY": "RHO-SYNTHETIC-INLINE-KEY-7741"
+      }
+    }
+  }
+}

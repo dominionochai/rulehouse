@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "atlassian": {
+      "url": "https://mcp.atlassian.com/v1/mcp?tools=all",
+      "headers": {
+        "Authorization": "Basic c3ZjLXJ1bmJvb2tAY29ycC5leGFtcGxlOlJITy1TWU5USEVUSUMtVE9LRU4tMDAwMg=="
+      }
+    }
+  }
+}

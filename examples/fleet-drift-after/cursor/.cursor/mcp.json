@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "atlassian": {
+      "url": "https://mcp.atlassian.com/v2/mcp",
+      "headers": {
+        "Authorization": "Bearer ${ATLASSIAN_SERVICE_KEY}"
+      }
+    }
+  }
+}

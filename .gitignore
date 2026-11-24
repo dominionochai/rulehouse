@@ -155,3 +155,8 @@ vite.config.ts.timestamp-*
 .nx/cache
 .nx/workspace-data
 .nx/migrate-runs
+
+# Rulehouse build and scan output
+dist/
+dist-test/
+rulehouse-out/

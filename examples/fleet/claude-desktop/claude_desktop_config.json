@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "atlassian": {
+      "type": "http",
+      "url": "https://mcp.atlassian.com/v2/mcp"
+    },
+    "runbook-automation": {
+      "type": "http",
+      "url": "https://mcp.atlassian.com/v2/mcp",
+      "headers": {
+        "Authorization": "Basic c3ZjLXJ1bmJvb2tAY29ycC5leGFtcGxlOlJITy1TWU5USEVUSUMtVE9LRU4tMDAwMQ=="
+      }
+    }
+  }
+}
