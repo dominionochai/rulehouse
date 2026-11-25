@@ -167,6 +167,12 @@ an oversight):
   not policy-checked; enforcement is at the request boundary, before
   execution.
 
+Every gateway test so far runs against a mock upstream. An opt-in live
+probe against a real Atlassian MCP endpoint exists behind environment
+variables (skipped by default; CI never touches the network or a
+credential) — see `docs/live-atlassian-mcp.md` for the exact procedure
+and the current live-run status.
+
 ## Provenance on mediated paths (Phase 3)
 
 The brief's distinction — **content an AI system can read is not
