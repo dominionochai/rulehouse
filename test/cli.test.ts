@@ -65,6 +65,7 @@ test("ledger verification exits 0 on an intact chain and 1 at the first falsifie
       provenance: null,
       enforcement: "forwarded-to-upstream",
       upstreamStatus: 200,
+      identitySource: "bearer-key",
     }, "2026-01-01T00:00:00.000Z");
 
     const intact = await withTempScan(path, ["ledger", path]);

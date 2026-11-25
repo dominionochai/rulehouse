@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "atlassian": {
+      "serverUrl": "https://mcp.atlassian.com/v2/mcp",
+      "disabledTools": ["delete_issue", "delete_page"]
+    },
+    "wiki-loader": {
+      "command": "npx",
+      "args": ["-y", "@corp/wiki-mcp-loader"],
+      "env": { "API_KEY": "${CORP_WIKI_LOADER_KEY}" }
+    }
+  }
+}

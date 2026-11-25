@@ -5,6 +5,14 @@ import { parseProvenanceFacts, type ProvenanceFact } from "../provenance.js";
 export { GENESIS_PREV };
 
 /**
+ * How the gateway came to believe it knows who made the request. The basis is
+ * recorded with the decision, not implied from the identity name: the same
+ * name can exist as a bearer-key identity and be asserted by a proxy, and an
+ * audit must be able to tell those records apart.
+ */
+export type IdentityBasis = "bearer-key" | "forwarded-header";
+
+/**
  * Why a tool call was mediated the way it was. The record explicitly
  * distinguishes the *decision* (policy, attribution, reason) from the
  * *enforcement result* (what actually happened to the request) -- collapsing
@@ -29,6 +37,11 @@ export interface LedgerRecord {
    * existed read back as null.
    */
   readonly provenance: readonly ProvenanceFact[] | null;
+  /**
+   * The attribution basis for this record's identity, or null when no
+   * identity was established (or the entry predates basis attribution).
+   */
+  readonly identitySource: IdentityBasis | null;
 }
 
 export interface LedgerEntry {
@@ -52,6 +65,7 @@ function decisionRecordOf(record: LedgerRecord): JsonObject {
     decision: { kind: record.decision.kind, ruleId: record.decision.ruleId, reason: record.decision.reason },
     enforcement: record.enforcement,
     upstreamStatus: record.upstreamStatus,
+    identitySource: record.identitySource,
     provenance: record.provenance === null
       ? null
       : record.provenance.map((fact) => ({ argument: fact.argument, contentSha256: fact.contentSha256, trust: fact.trust })),
@@ -99,6 +113,9 @@ export class LedgerWriter {
   }
 
   async append(record: LedgerRecord, at: string): Promise<LedgerEntry> {
+    if (record.identity === null && record.identitySource !== null) {
+      throw new Error("a ledger record cannot carry an attribution basis without an identity");
+    }
     const entry = await this.chain.append(decisionRecordOf(record), at);
     return { ...entry, record };
   }
@@ -119,6 +136,13 @@ function parseRecord(value: Json | undefined): LedgerRecord | null {
   if (enforcement !== "blocked-at-gateway" && enforcement !== "forwarded-to-upstream" && enforcement !== "failed-forwarding") return null;
   const upstreamStatus = value["upstreamStatus"];
   if (upstreamStatus !== null && (typeof upstreamStatus !== "number" || !Number.isInteger(upstreamStatus))) return null;
+  const identitySourceField = value["identitySource"];
+  let identitySource: IdentityBasis | null = null;
+  if (identitySourceField !== undefined && identitySourceField !== null) {
+    if (identitySourceField !== "bearer-key" && identitySourceField !== "forwarded-header") return null;
+    if (identity === null) return null;
+    identitySource = identitySourceField as IdentityBasis;
+  }
   const provenanceField = value["provenance"];
   let provenance: readonly ProvenanceFact[] | null = null;
   if (provenanceField !== undefined && provenanceField !== null) {
@@ -134,6 +158,7 @@ function parseRecord(value: Json | undefined): LedgerRecord | null {
     enforcement,
     upstreamStatus,
     provenance,
+    identitySource,
   };
 }
 

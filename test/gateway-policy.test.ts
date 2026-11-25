@@ -6,7 +6,7 @@ import { readGatewayConfig } from "../src/gateway/config.js";
 import type { GatewayPolicies } from "../src/gateway/config.js";
 import { contentDigestOf, type ProvenanceRecord, type ProvenanceRegistry, type ProvenanceTrust } from "../src/provenance.js";
 import type { Decision } from "../src/gateway/authorize.js";
-import type { JsonObject } from "../src/lib/json.js";
+import { parseLooseJson, type JsonObject } from "../src/lib/json.js";
 
 test("tool patterns match literally except for the star wildcard", () => {
   assert.equal(matchesPattern("get_issue", "get_issue"), true);
@@ -331,3 +331,41 @@ test("config validation refuses provenance checks it could never satisfy", () =>
     "unclassified/unavailable are observed states, not declarations an operator can require");
 });
 
+
+test("proxy-asserted identity is off unless opted in, and validates its header", () => {
+  const env = (): string | undefined => undefined;
+  const baseDocument = (): Record<string, unknown> => {
+    const loose = parseLooseJson(gatewayConfigText(), "cfg");
+    assert.deepEqual(loose.diagnostics, []);
+    return JSON.parse(JSON.stringify(loose.value)) as Record<string, unknown>;
+  };
+  const run = (document: Record<string, unknown>) =>
+    readGatewayConfig(JSON.stringify(document), "config.json", env);
+
+  const off = run(baseDocument());
+  assert.ok(off.config !== null);
+  assert.equal(off.config.trustForwardedIdentity, null);
+
+  const optedIn = run({ ...baseDocument(), trustForwardedIdentity: { header: "X-Rulehouse-Identity" } });
+  assert.ok(optedIn.config !== null);
+  assert.deepEqual(optedIn.config.trustForwardedIdentity, { header: "x-rulehouse-identity" });
+  assert.deepEqual(optedIn.diagnostics, []);
+
+  const problems = (subject: unknown): readonly string[] => {
+    const result = run({ ...baseDocument(), trustForwardedIdentity: subject });
+    assert.ok(result.config !== null || result.diagnostics.some((d) => d.message.length > 0));
+    return result.diagnostics.map((d) => `${d.subject}: ${d.message}`);
+  };
+
+  const usurped = problems({ header: "Authorization" });
+  assert.ok(usurped.some((d) => d.includes("cannot carry a proxy-asserted identity")));
+
+  const invalid = problems({ header: "not a header name" });
+  assert.ok(invalid.some((d) => d.includes("is not a valid header name")));
+
+  const unnamed = problems({ header: "" });
+  assert.ok(unnamed.some((d) => d.includes("/trustForwardedIdentity/header")));
+
+  const shapeless = problems("X-Rulehouse-Identity");
+  assert.ok(shapeless.some((d) => d.includes("/trustForwardedIdentity")));
+});

@@ -2,7 +2,7 @@
 
 Rulehouse is an enterprise security control plane for governing how
 AI-connected systems access organizational information. The repository
-contains four working phases:
+contains five working phases:
 
 - **Phase 1 — Continuous Assurance**: a zero-dependency scanner that
   inventories Atlassian MCP client configurations, evaluates a defined
@@ -22,6 +22,12 @@ contains four working phases:
   delegation registry whose decisions are computed by the same policy
   engine as direct calls — a delegatee can never exceed its delegator
   because there is no separate delegation policy to drift.
+- **Phase 5 — Enterprise client fleet and asserted identity**: the
+  scanner reads Windsurf/Devin, Zed, Gemini CLI, and Codex CLI
+  configurations alongside the Phase-1 clients, and the gateway can (only
+  when explicitly opted in) accept a proxy-asserted identity from a
+  trusted authenticating reverse proxy, with the attribution basis
+  recorded per decision.
 
 **Scope honesty, up front.** Continuous Assurance discovers and verifies
 configuration. It does not intercept, mediate, or enforce anything: a
@@ -274,6 +280,82 @@ node dist/index.js a2a simulate examples/a2a/delegations.jsonl \
   makes decisions reproducible -- and means callers must pass a real
   clock in production integrations.
 
+## Enterprise fleet coverage and asserted identity (Phase 5)
+
+### Fleet coverage
+
+The scanner now reads five more client vocabularies through the same
+inventory, snapshot, diff, and policy-parity pipeline — no per-client
+special cases downstream:
+
+| Client | File | Container | Notes |
+| --- | --- | --- | --- |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` | `mcpServers` | `serverUrl`/`url` remotes; `disabledTools` make local client-side restrictions part of the inventory and parity evidence |
+| Devin Desktop | `~/.config/devin/mcp_config.json` | `mcpServers` | same vocabulary as Windsurf; attributed from the install path |
+| Zed | `~/.config/zed/settings.json` | `context_servers` | Claude-style `mcpServers` blocks inside Zed's settings.json are ignored by Zed itself, so they are not a candidate container here either; remote entries authenticate via `headers` or OAuth |
+| Gemini CLI | `~/.gemini/settings.json` (or project `.gemini/`) | `mcpServers` | `httpUrl` (streamable HTTP) takes precedence over `url` (SSE); setting both is diagnosed, never silently resolved |
+| Codex CLI | `~/.codex/config.toml` | `[mcp_servers.*]` | read through a strict TOML subset parser that fails as diagnostics, not as crashes |
+
+A new TOML subset parser (`src/lib/toml.ts`) covers tables, dotted and
+quoted keys, basic/literal strings, integers, booleans, arrays, and
+comments — and rejects everything else it meets (inline tables, floats,
+dates, array-of-tables) with a diagnostic and a clean resync, so one
+exotic value cannot cost the rest of the file's evidence. Its behavior is
+pinned by 26 tests, including resync and duplicate/redefinition cases.
+
+Generic filenames are matched conservatively: `settings.json` is a
+candidate only under `/.zed/` or `/.gemini/`, and `config.toml` only
+under `/.codex/` — an unrelated editor settings file never becomes a
+finding. `mcp_config.json` is a candidate anywhere, since it is
+vendor-specific by name. See `examples/fleet-extended/` for a readable
+five-client fixture.
+
+The inventory surface for these clients covers servers, transports,
+remotes, auth views, and (where the client vocabulary has them)
+client-side tool restrictions. Zed's per-tool `agent.tool_permissions`
+and Gemini's `mcp.allowed`/`mcp.excluded` lists are **not** yet
+inventoried — they are noted here as a boundary, not silently ignored.
+
+### Proxy-asserted identity (opt-in)
+
+When the gateway sits behind an authenticating reverse proxy (typically
+also the TLS terminator), the proxy — not the gateway — is in a position
+to know who the human on the other end is. With
+
+```json
+"trustForwardedIdentity": { "header": "x-rulehouse-identity" }
+```
+
+the gateway attributes requests that present **no bearer key** to the
+configured identity named by that header's value. The rules are strict,
+because this is the kind of feature that quietly becomes a bypass:
+
+- **Off by default.** Without the opt-in, such a header has no authority
+  whatsoever (tested).
+- **Exact name match against the identity registry.** An asserted value
+  that names no configured identity authenticates no one (tested).
+- **Never a downgrade.** A request bearing a bearer key is authenticated
+  only by that key; a failing key is refused even when a matching
+  assertion header is present (tested); and a live key is never
+  overridden by a header naming a different identity (tested).
+- **Attribution basis is on the record.** Every ledger entry carries
+  `identitySource: "bearer-key" | "forwarded-header"`, so an audit can
+  always tell which trust path backed a decision. Entries predating the
+  field read back with a null basis, never a fabricated one.
+- **The trust boundary is stated loudly.** The gateway is loopback-only
+  and cannot verify who set the header. Enabling this widens the trust
+  boundary to every process that can reach the listener: the proxy must
+  strip any client-supplied copy of the header, and no other local
+  process should be able to forward to the listener. The same warning is
+  written to stderr on every startup with the feature enabled.
+
+**Scope honesty.** With a forwarded identity, the *gateway's* decision
+record names the proxied identity with its basis. That does not repair
+Atlassian's native audit trails on the upstream side, and it does not
+make the assertion cryptographic — the upstream still sees the gateway's
+upstream credential, and the assertion is only as trustworthy as the
+proxy deployment.
+
 ## Phase-1 scanner
 
 The Continuous Assurance side of the tool: point `scan` at a directory
@@ -349,6 +431,11 @@ and all) and computes a canonical fingerprint over
 - `.cursor/mcp.json` (Cursor)
 - `.vscode/mcp.json` (VS Code, `servers`)
 - generic `mcp.json` (`mcpServers`)
+- `.codeium/windsurf/mcp_config.json` (Windsurf) and
+  `.config/devin/mcp_config.json` (Devin Desktop, same vocabulary)
+- `.zed/settings.json` (Zed, `context_servers`)
+- `.gemini/settings.json` (Gemini CLI, `mcpServers` with `httpUrl`/`url`)
+- `.codex/config.toml` (Codex CLI, `[mcp_servers.*]`, via TOML subset)
 
 JSONC relaxations (comments, trailing commas) are accepted through a
 single-pass normalizer; anything unparseable yields a diagnostic, never a
@@ -372,3 +459,7 @@ npm test             # tests run via node:test against compiled output
   demonstrated control point.
 - No chat interface, no model training, no replacement for Atlassian's
   identity or permission system.
+- No unconditional proxy-asserted identity — forwarded-identity trust is
+  opt-in, exact-match, recorded as such in the ledger, and warned about
+  on every startup; the default gateway authenticates from client keys
+  alone.

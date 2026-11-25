@@ -12,7 +12,22 @@ export interface ScanDiagnostic {
   readonly message: string;
 }
 
-export type ClientFormat = "claude-desktop" | "claude-code" | "cursor" | "mcp-json" | "vscode";
+/**
+ * One supported client-configuration vocabulary. The Phase-5 expansion adds
+ * Windsurf/Devin (one config vocabulary, two install paths), Zed
+ * (`context_servers`), Gemini CLI (`httpUrl`/`url`), and Codex (TOML).
+ */
+export type ClientFormat =
+  | "claude-desktop"
+  | "claude-code"
+  | "cursor"
+  | "mcp-json"
+  | "vscode"
+  | "windsurf"
+  | "devin"
+  | "zed"
+  | "gemini-cli"
+  | "codex";
 
 export interface SourceLocation {
   readonly file: string;
@@ -67,6 +82,14 @@ export interface InventoryEntry {
   readonly auth: AuthView;
   /** Raw `tools=` query parameter values when present, else null. */
   readonly toolsOverride: readonly string[] | null;
+  /**
+   * Tools the client itself is configured to hold back from the server (e.g.
+   * Windsurf's `disabledTools`), or an empty array when the client runs the
+   * server with nothing disabled. Null means the client vocabulary has no
+   * such field for this entry, so "not visible" stays distinct from
+   * "explicitly unrestricted".
+   */
+  readonly disabledTools: readonly string[] | null;
   readonly source: SourceLocation;
 }
 

@@ -53,12 +53,25 @@ const CREDENTIALISH_HEADERS = new Set([
  * Assigns each recognized filename pattern its provenance. Provenance matters
  * for the parity rule (Claude Code and Cursor files share one vocabulary but
  * belong to different agents) and for the report's evidence trail.
+ *
+ * Windsurf and Devin share one filename (`mcp_config.json`), so only the
+ * install path tells them apart; a file with no path evidence is attributed
+ * to Windsurf, which owns the filename historically, and the client column of
+ * the report still shows exactly what was (and was not) matched.
  */
 export function formatForPath(path: string, documentHasKeyServers: boolean): ClientFormat {
   const name = basename(path);
   if (name === "claude_desktop_config.json") return "claude-desktop";
+  if (name === "mcp_config.json") {
+    if (path.includes(".codeium")) return "windsurf";
+    if (path.includes(".devin") || path.includes("/devin/")) return "devin";
+    return "windsurf";
+  }
+  if (name === "config.toml") return "codex";
   if (path.includes("/.cursor/")) return "cursor";
   if (path.includes("/.vscode/")) return "vscode";
+  if (path.includes("/.zed/")) return "zed";
+  if (path.includes("/.gemini/")) return "gemini-cli";
   if (name === ".mcp.json") return "claude-code";
   return documentHasKeyServers ? "vscode" : "mcp-json";
 }
@@ -74,9 +87,13 @@ export function parseDocument(
   const doc = document as { readonly [key: string]: Json };
 
   const keys = Object.keys(doc);
-  const containerKey = keys.includes("mcpServers") ? "mcpServers" : keys.includes("servers") ? "servers" : null;
+  const containerKeys = ["mcpServers", "mcp_servers", "servers", "context_servers"] as const;
+  const containerKey = containerKeys.find((key) => keys.includes(key)) ?? null;
   if (containerKey === null) {
-    return { entries: [], diagnostics: [diag(file, "$", 'no "mcpServers" or "servers" container found')] };
+    return {
+      entries: [],
+      diagnostics: [diag(file, "$", 'no "mcpServers", "mcp_servers", "servers", or "context_servers" container found')],
+    };
   }
 
   const container = doc[containerKey];
@@ -123,7 +140,8 @@ function buildEntry(
 
   const { credentialPairs, pairDiagnostics } = readCredentialPairs(entry, file, pointer);
   const { auth } = extractAuth(credentialPairs, resolveEnv);
-  const diagnostics = [...pairDiagnostics];
+  const { disabledTools, diagnostics: toolDiagnostics } = disabledToolsOf(entry, file, pointer);
+  const diagnostics = [...pairDiagnostics, ...toolDiagnostics];
 
   if (transport === "local") {
     const command = entry["command"];
@@ -145,6 +163,7 @@ function buildEntry(
           endpointClass: "local",
           auth,
           toolsOverride: null,
+          disabledTools,
           source,
         },
       ],
@@ -152,9 +171,15 @@ function buildEntry(
     };
   }
 
-  const urlText = entry["url"];
-  if (typeof urlText !== "string") {
+  const urlText = remoteUrlOf(entry);
+  if (urlText === null) {
     return { entries: [], diagnostics: [diag(file, pointer, "remote entry url is not a string")] };
+  }
+  const aliases = REMOTE_URL_KEYS.filter((key) => typeof entry[key] === "string" && (entry[key] as string).length > 0);
+  if (aliases.length > 1) {
+    diagnostics.push(
+      diag(file, pointer, `remote URL is set through ${aliases.map((key) => `"${key}"`).join(" and ")}; "${aliases[0]}" was used per the client's documented precedence`),
+    );
   }
 
   return {
@@ -168,6 +193,7 @@ function buildEntry(
         endpointClass: endpointClassForUrl(urlText),
         auth,
         toolsOverride: toolsOverrideOf(urlText),
+        disabledTools,
         source,
       },
     ],
@@ -175,10 +201,45 @@ function buildEntry(
   };
 }
 
+/**
+ * Remote URL fields across the supported vocabularies, in precedence order:
+ * Gemini CLI prefers `httpUrl` (streamable HTTP) over `url` (SSE), and
+ * Windsurf documents `serverUrl` alongside `url`. One ordered list serves
+ * every client, keeps each lookup honest about the client's own precedence,
+ * and makes "both fields set" a diagnosable ambiguity instead of a silent
+ * choice.
+ */
+const REMOTE_URL_KEYS = ["httpUrl", "serverUrl", "url"] as const;
+
+function remoteUrlOf(entry: { readonly [key: string]: Json }): string | null {
+  for (const key of REMOTE_URL_KEYS) {
+    const value = entry[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return null;
+}
+
 function transportOf(entry: { readonly [key: string]: Json }): Transport | null {
-  if (typeof entry["url"] === "string" && entry["url"].length > 0) return "remote";
+  if (remoteUrlOf(entry) !== null) return "remote";
   if (typeof entry["command"] === "string" && entry["command"].length > 0) return "local";
   return null;
+}
+
+function disabledToolsOf(
+  entry: { readonly [key: string]: Json },
+  file: string,
+  pointer: string,
+): { readonly disabledTools: readonly string[] | null; readonly diagnostics: readonly ScanDiagnostic[] } {
+  const raw = entry["disabledTools"];
+  if (raw === undefined || raw === null) return { disabledTools: null, diagnostics: [] };
+  if (!Array.isArray(raw)) {
+    return { disabledTools: null, diagnostics: [diag(file, `${pointer}/disabledTools`, "disabledTools is not an array; tool restrictions were not evaluated")] };
+  }
+  const tools = raw.filter((tool): tool is string => typeof tool === "string");
+  const diagnostics = tools.length !== raw.length
+    ? [diag(file, `${pointer}/disabledTools`, "disabledTools contains non-string items; those items were skipped in the restriction list")]
+    : [];
+  return { disabledTools: tools, diagnostics };
 }
 
 function toolsOverrideOf(urlText: string): readonly string[] | null {

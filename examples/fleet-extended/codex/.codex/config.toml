@@ -1,0 +1,12 @@
+# Codex CLI configuration (synthetic fleet fixture).
+
+model = "gpt-5.1-codex"
+
+[mcp_servers.atlassian]
+url = "https://mcp.atlassian.com/v2/mcp"
+
+[mcp_servers.atlassian.env]
+JIRA_TOKEN = "RHO-SYNTHETIC-CODEX-TOKEN"
+
+[mcp_servers.retiring-connector]
+url = "https://mcp.atlassian.com/v1/sse"

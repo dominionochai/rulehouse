@@ -14,6 +14,7 @@ function entry(overrides: Partial<InventoryEntry> & { readonly serverName?: stri
     endpointClass: "atlassian-v2",
     auth: { kind: "oauth" },
     toolsOverride: null,
+    disabledTools: null,
     source: { file: "a.json", pointer: "/mcpServers/atlassian", format: "claude-code" },
   };
   return { ...base, ...overrides, source: overrides.source ?? base.source } as InventoryEntry;

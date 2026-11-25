@@ -7,7 +7,7 @@ import { authKey, type InventoryEntry } from "./model.js";
  * facet later automatically extends change detection, the exit code, and the
  * report, because nothing else knows the facet list.
  */
-const FACETS = ["endpoint", "url", "tools", "auth", "credential", "username"] as const;
+const FACETS = ["endpoint", "url", "tools", "restrictions", "auth", "credential", "username"] as const;
 export type FacetName = (typeof FACETS)[number];
 
 export interface FieldChange {
@@ -49,6 +49,7 @@ interface FacetState {
   readonly endpoint: string;
   readonly url: string;
   readonly tools: string;
+  readonly restrictions: string;
   readonly auth: string;
   readonly credential: string;
   readonly username: string;
@@ -59,6 +60,7 @@ function facetsOf(entry: InventoryEntry): FacetState {
     endpoint: entry.endpointClass,
     url: entry.url ?? "<none>",
     tools: entry.toolsOverride === null ? "default" : `tools=${entry.toolsOverride.join(",")}`,
+    restrictions: entry.disabledTools === null ? "<not visible>" : entry.disabledTools.length === 0 ? "none" : `without ${entry.disabledTools.join(",")}`,
     auth: authKey(entry.auth),
     credential: credentialFacet(entry),
     username: entry.auth.kind === "api-token" && entry.auth.username !== null ? entry.auth.username : "<none>",

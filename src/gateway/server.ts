@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createServer, type Server } from "node:http";
 import type { GatewayConfig, GatewayIdentity } from "./config.js";
+import type { IdentityBasis } from "./ledger.js";
 import { METHOD_RULE_ID, evaluateToolCall, type Decision } from "./authorize.js";
 import { LedgerWriter, type LedgerRecord } from "./ledger.js";
 import { readProvenanceRegistry, type ProvenanceFact } from "../provenance.js";
@@ -95,7 +96,8 @@ async function mediateOne(
 
     const body = await readBody(request);
     const presentedKey = extractBearerKey(request.headers.authorization);
-    const identity = presentedKey === null ? null : authenticate(identities, presentedKey);
+    const authenticated = presentedKey === null ? null : authenticate(identities, presentedKey);
+    const identity = authenticated ?? (presentedKey === null ? assertForwardedIdentity(config, request.headers, identities) : null);
     if (identity === null) {
       response.setHeader("WWW-Authenticate", "Bearer");
       await reject(response, writer, {
@@ -105,9 +107,11 @@ async function mediateOne(
         decision: { kind: "denied", ruleId: "RH-GW-AUTH", reason: "client presented no key matching a configured identity" },
         provenance: null,
         status: 401,
+        identitySource: null,
       }, decisionIdOf(null, parseMethodSafely(body), null, ""), null);
       return;
     }
+    const identitySource: IdentityBasis = authenticated !== null ? "bearer-key" : "forwarded-header";
 
     const parsed = parseJsonRpcRequest(body);
     if (typeof parsed === "string") {
@@ -117,9 +121,9 @@ async function mediateOne(
 
     const sessionHeaders = sessionHeadersOf(request);
     if (parsed.method === "tools/call") {
-      await mediateToolCall(config, writer, upstream, identity, parsed, body, sessionHeaders, response);
+      await mediateToolCall(config, writer, upstream, identity, identitySource, parsed, body, sessionHeaders, response);
     } else {
-      await mediatePassthrough(config, writer, upstream, identity, parsed, body, sessionHeaders, response);
+      await mediatePassthrough(config, writer, upstream, identity, identitySource, parsed, body, sessionHeaders, response);
     }
   } catch (error) {
     process.stderr.write(`rulehouse gateway: mediation failed without forwarding: ${(error as Error).message}\n`);
@@ -140,6 +144,7 @@ async function mediateToolCall(
   writer: LedgerWriter,
   upstream: UpstreamCredential,
   identity: GatewayIdentity,
+  identitySource: IdentityBasis,
   parsed: ParsedRequest,
   body: string,
   sessionHeaders: Record<string, string>,
@@ -162,6 +167,7 @@ async function mediateToolCall(
       decision: { kind: "denied" as const, ruleId: decision.ruleId, reason: decision.reason },
       provenance: decision.provenance.length === 0 ? null : decision.provenance,
       status: 403,
+      identitySource,
     }, decisionId, parsed.id);
     return;
   }
@@ -176,14 +182,15 @@ async function mediateToolCall(
         decision: { kind: "denied", ruleId: decision.ruleId, reason: `rule ${decision.ruleId} requires human approval; decision ${decisionId} is not approved yet` },
         provenance: decision.provenance.length === 0 ? null : decision.provenance,
         status: 403,
+        identitySource,
       }, decisionId, parsed.id);
       return;
     }
-    await forwardAndRecord(config, writer, upstream, identity, parsed, body, decisionId, decision, `${decision.reason}; executed under operator approval ${decisionId}`, sessionHeaders, response);
+    await forwardAndRecord(config, writer, upstream, identity, identitySource, parsed, body, decisionId, decision, `${decision.reason}; executed under operator approval ${decisionId}`, sessionHeaders, response);
     return;
   }
 
-  await forwardAndRecord(config, writer, upstream, identity, parsed, body, decisionId, decision, decision.reason, sessionHeaders, response);
+  await forwardAndRecord(config, writer, upstream, identity, identitySource, parsed, body, decisionId, decision, decision.reason, sessionHeaders, response);
 }
 
 async function mediatePassthrough(
@@ -191,6 +198,7 @@ async function mediatePassthrough(
   writer: LedgerWriter,
   upstream: UpstreamCredential,
   identity: GatewayIdentity,
+  identitySource: IdentityBasis,
   parsed: ParsedRequest,
   body: string,
   sessionHeaders: Record<string, string>,
@@ -209,6 +217,7 @@ async function mediatePassthrough(
       : { kind: "denied", ruleId: METHOD_RULE_ID, reason: `upstream was unreachable for ${parsed.method}` },
     enforcement: outcome.forwarded ? "forwarded-to-upstream" : "failed-forwarding",
     upstreamStatus: outcome.forwarded ? outcome.status : null,
+    identitySource,
   }, new Date().toISOString());
   deliver(response, parsed.id, outcome);
 }
@@ -280,6 +289,24 @@ function stableJson(value: unknown): string {
     return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson((value as { readonly [key: string]: unknown })[key])}`).join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+/**
+ * Establishes identity from the configured assertion header. The asserted
+ * value must name a configured identity exactly: anything else -- header
+ * absent, repeated (so no single value is assertable), or naming no
+ * configured identity -- authenticates no one.
+ */
+function assertForwardedIdentity(
+  config: GatewayConfig,
+  headers: IncomingMessage["headers"],
+  identities: ReadonlyMap<string, GatewayIdentity>,
+): GatewayIdentity | null {
+  const trusted = config.trustForwardedIdentity;
+  if (trusted === null) return null;
+  const asserted = headers[trusted.header];
+  if (typeof asserted !== "string") return null;
+  return identities.get(asserted) ?? null;
 }
 
 function extractBearerKey(header: string | undefined): string | null {
@@ -373,6 +400,7 @@ async function forwardAndRecord(
   writer: LedgerWriter,
   upstream: UpstreamCredential,
   identity: GatewayIdentity,
+  identitySource: IdentityBasis,
   parsed: ParsedRequest,
   body: string,
   decisionId: string,
@@ -391,6 +419,7 @@ async function forwardAndRecord(
     decision: { kind: outcome.forwarded && outcome.status < 400 ? "allowed" : "denied", ruleId: decision.ruleId, reason },
     enforcement: outcome.forwarded ? "forwarded-to-upstream" : "failed-forwarding",
     upstreamStatus: outcome.forwarded ? outcome.status : null,
+    identitySource,
   }, new Date().toISOString());
   deliver(response, parsed.id, outcome);
 }
@@ -416,6 +445,7 @@ interface Rejection {
   readonly decision: { readonly kind: "denied"; readonly ruleId: string; readonly reason: string };
   readonly provenance: readonly ProvenanceFact[] | null;
   readonly status: number;
+  readonly identitySource: IdentityBasis | null;
 }
 
 async function reject(
@@ -434,6 +464,7 @@ async function reject(
     enforcement: "blocked-at-gateway",
     upstreamStatus: null,
     provenance: rejection.provenance,
+    identitySource: rejection.identitySource,
   };
   await writer.append(record, new Date().toISOString());
   respondJsonRpc(response, rejection.status, jsonRpcId, {

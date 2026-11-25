@@ -12,7 +12,8 @@ import { canonicalize, sha256Hex, type Json } from "./lib/json.js";
  */
 export interface Snapshot {
   readonly format: "rulehouse.snapshot";
-  readonly version: 1;
+  /** Version 2 added `disabledTools` to inventory entries (Phase 5). */
+  readonly version: 2;
   readonly capturedAt: string;
   readonly root: string;
   readonly fingerprint: string;
@@ -36,7 +37,7 @@ export function fingerprintOf(inputs: readonly FingerprintedInput[], inventory: 
 export function snapshotOf(scan: ScanOutput, capturedAt: string): Snapshot {
   return {
     format: SNAPSHOT_FORMAT,
-    version: 1,
+    version: 2,
     capturedAt,
     root: scan.root,
     fingerprint: fingerprintOf(scan.inputs, scan.inventory, scan.diagnostics),
@@ -84,6 +85,7 @@ function entryToJson(entry: InventoryEntry): Json {
     endpointClass: entry.endpointClass,
     auth: authToJson(entry.auth),
     toolsOverride: entry.toolsOverride,
+    disabledTools: entry.disabledTools,
     source: entry.source,
   });
 }
@@ -133,7 +135,7 @@ export function snapshotFromDocument(document: Json): ReadResult {
   const record = asRecord(document);
   if (record === null) return { ok: false, error: "snapshot document is not a JSON object" };
   if (record["format"] !== SNAPSHOT_FORMAT) return { ok: false, error: `not a ${SNAPSHOT_FORMAT} document` };
-  if (record["version"] !== 1) return { ok: false, error: `unsupported snapshot version ${JSON.stringify(record["version"])}` };
+  if (record["version"] !== 2) return { ok: false, error: `unsupported snapshot version ${JSON.stringify(record["version"])}; regenerate the snapshot with this version of Rulehouse` };
 
   const capturedAt = asString(record["capturedAt"]);
   const root = asString(record["root"]);
@@ -162,7 +164,7 @@ export function snapshotFromDocument(document: Json): ReadResult {
     ok: true,
     snapshot: {
       format: SNAPSHOT_FORMAT,
-      version: 1,
+      version: 2,
       capturedAt,
       root,
       fingerprint: storedFingerprint,
@@ -217,13 +219,16 @@ function entryFromJson(record: Record<string, unknown> | null): InventoryEntry |
   const url = record["url"] === null ? null : asString(record["url"]);
   const rawTools = record["toolsOverride"];
   const toolsOverride = rawTools === null || rawTools === undefined ? null : arrayOrEmpty(rawTools).map((t) => asString(t));
+  const rawDisabled = record["disabledTools"];
+  const disabledTools = rawDisabled === null || rawDisabled === undefined ? null : arrayOrEmpty(rawDisabled).map((t) => asString(t));
   const source = sourceFromJson(asRecord(record["source"]));
   const auth = authFromJson(asRecord(record["auth"]));
 
   if (
     client === null || serverName === null || serverKey === null || endpointClass === null || auth === null ||
     (transport !== "remote" && transport !== "local") || url === null && transport === "remote" ||
-    (toolsOverride !== null && toolsOverride.includes(null))
+    (toolsOverride !== null && toolsOverride.includes(null)) ||
+    (disabledTools !== null && disabledTools.includes(null))
   ) {
     return null;
   }
@@ -237,6 +242,7 @@ function entryFromJson(record: Record<string, unknown> | null): InventoryEntry |
     endpointClass: endpointClass as EndpointClass,
     auth,
     toolsOverride: toolsOverride === null ? null : toolsOverride.map((t) => t ?? ""),
+    disabledTools: disabledTools === null ? null : disabledTools.map((t) => t ?? ""),
     source,
   };
 }

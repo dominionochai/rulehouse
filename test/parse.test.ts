@@ -138,3 +138,51 @@ test("real process env resolution is wired by default", () => {
   const result = parse(`{"mcpServers": {"a": {"url": "https://mcp.atlassian.com/v2/mcp", "headers": {"Authorization": "Basic ${encoded}"}}}}`, "mcp.json", resolveFromProcessEnv);
   assert.equal(result.entries[0]!.auth.kind, "api-token");
 });
+
+test("Windsurf and Devin share a filename and are told apart by install path", () => {
+  assert.equal(formatForPath("/home/me/.codeium/windsurf/mcp_config.json", true), "windsurf");
+  assert.equal(formatForPath("/home/me/.codeium/windsurf-next/mcp_config.json", true), "windsurf");
+  assert.equal(formatForPath("/home/me/.config/devin/mcp_config.json", true), "devin");
+});
+
+test("windsurf vocabulary parses serverUrl remotes and honors the disabledTools list", () => {
+  const result = parse('{"mcpServers": {"atlassian": {"serverUrl": "https://mcp.atlassian.com/v2/mcp", "disabledTools": ["delete_issue"]}}}', "/home/me/.codeium/windsurf/mcp_config.json");
+  const entry = result.entries[0]!;
+  assert.equal(entry.url, "https://mcp.atlassian.com/v2/mcp");
+  assert.deepEqual(entry.disabledTools, ["delete_issue"]);
+  assert.deepEqual(result.diagnostics, []);
+});
+
+test("malformed disabledTools is diagnosed, not silently armed", () => {
+  const result = parse('{"mcpServers": {"a": {"url": "https://mcp.atlassian.com/v2/mcp", "disabledTools": "delete_*"}}}');
+  const entry = result.entries[0]!;
+  assert.equal(entry.disabledTools, null);
+  assert.match(result.diagnostics[0]!.message, /disabledTools is not an array/);
+});
+
+test("zed context_servers entries keep their provenance distinct from every other format", () => {
+  const result = parse(
+    '{"context_servers": {"atlassian": {"source": "custom", "url": "https://mcp.atlassian.com/v2/mcp"}, "loader": {"source": "custom", "command": "npx"}}}',
+    "/home/me/.zed/settings.json",
+  );
+  assert.equal(result.entries[0]!.client, "zed");
+  assert.equal(result.entries[0]!.transport, "remote");
+  assert.equal(result.entries[1]!.serverKey, "local:npx");
+});
+
+test("gemini cli resolves httpUrl before url and says so when both are set", () => {
+  const result = parse(
+    '{"mcpServers": {"atlassian": {"httpUrl": "https://mcp.atlassian.com/v2/mcp", "url": "https://mcp.atlassian.com/v1/sse"}}}',
+    "/home/me/.gemini/settings.json",
+  );
+  const entry = result.entries[0]!;
+  assert.equal(entry.client, "gemini-cli");
+  assert.equal(entry.url, "https://mcp.atlassian.com/v2/mcp");
+  assert.equal(entry.endpointClass, "atlassian-v2");
+  assert.match(result.diagnostics[0]!.message, /"httpUrl" and "url"/);
+});
+
+test("documents without any recognized container keep a precise diagnostic", () => {
+  const result = parse('{"agent": {}}');
+  assert.match(result.diagnostics[0]!.message, /container/);
+});

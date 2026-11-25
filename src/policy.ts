@@ -339,7 +339,11 @@ function endpointParityGroup(group: ServerGroup): readonly RuleVerdict[] {
 }
 
 function toolSignature(entry: InventoryEntry): string {
-  return entry.toolsOverride === null ? "default exposure" : `tools=${entry.toolsOverride.join(",")}`;
+  const exposure = entry.toolsOverride === null ? "default exposure" : `tools=${entry.toolsOverride.join(",")}`;
+  const restrictions = entry.disabledTools === null || entry.disabledTools.length === 0
+    ? ""
+    : ` without ${entry.disabledTools.join(",")}`;
+  return `${exposure}${restrictions}`;
 }
 
 function firstToolSignatureOf(group: ServerGroup): string {

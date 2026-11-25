@@ -4,6 +4,8 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GENESIS_PREV, LedgerWriter, ledgerEntryHash, readLedger, verifyLedger } from "../src/gateway/ledger.js";
+import { chainHash } from "../src/lib/chain.js";
+import type { Json } from "../src/lib/json.js";
 import type { LedgerRecord } from "../src/gateway/ledger.js";
 
 function record(overrides: Partial<LedgerRecord> = {}): LedgerRecord {
@@ -16,6 +18,7 @@ function record(overrides: Partial<LedgerRecord> = {}): LedgerRecord {
     enforcement: "forwarded-to-upstream",
     upstreamStatus: 200,
     provenance: null,
+    identitySource: "bearer-key",
     ...overrides,
   };
 }
@@ -94,10 +97,61 @@ test("readLedger returns parsed entries with their exact fields", async () => {
   const dir = await mkdtemp(join(tmpdir(), "rh-ledger-"));
   const path = join(dir, "ledger.jsonl");
   const writer = await LedgerWriter.open(path);
-  await writer.append(record({ identity: null, method: null, tool: null }), "2026-01-01T00:00:00.000Z");
+  await writer.append(record({ identity: null, method: null, tool: null, identitySource: null }), "2026-01-01T00:00:00.000Z");
   const read = await readLedger(path);
   assert.equal(read.problem, null);
   assert.equal(read.entries.length, 1);
   assert.equal(read.entries[0]!.record.identity, null);
   assert.equal(read.entries[0]!.record.method, null);
+});
+
+test("a record claiming an attribution basis without an identity cannot enter the ledger", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "rh-ledger-"));
+  const path = join(dir, "ledger.jsonl");
+  const writer = await LedgerWriter.open(path);
+  await assert.rejects(
+    () => writer.append(record({ identity: null, identitySource: "bearer-key" }), "2026-01-01T00:00:00.000Z"),
+    /attribution basis without an identity/,
+  );
+});
+
+test("entries written before identity-source attribution read back with a null basis", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "rh-ledger-"));
+  const path = join(dir, "ledger.jsonl");
+  const writer = await LedgerWriter.open(path);
+  await writer.append(record(), "2026-01-01T00:00:00.000Z");
+
+  const lines = (await readFile(path, "utf8")).split("\n").filter((line) => line.length > 0);
+  const first = JSON.parse(lines[0]!) as { hash: string };
+  const legacyRecord = {
+    decisionId: "sha256:" + "2".repeat(64),
+    identity: "amara",
+    method: "tools/call",
+    tool: "search_pages",
+    decision: { kind: "allowed", ruleId: "RH-GW-READ", reason: "read" },
+    enforcement: "forwarded-to-upstream",
+    upstreamStatus: 200,
+    provenance: null,
+  };
+  const at = "2026-01-01T00:00:01.000Z";
+  const hash = chainHash(1, at, first.hash, legacyRecord);
+  lines.push(JSON.stringify({ seq: 1, at, prev: first.hash, hash, record: legacyRecord }));
+  await writeFile(path, lines.join("\n") + "\n", "utf8");
+
+  const read = await readLedger(path);
+  assert.equal(read.problem, null);
+  assert.equal(read.entries.length, 2);
+  assert.equal(read.entries[1]!.record.identitySource, null, "the basis is null, not fabricated");
+  assert.equal((await verifyLedger(path)).ok, true);
+});
+
+test("a basis on an identity-less entry fails the record parse, not just a lint", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "rh-ledger-"));
+  const path = join(dir, "ledger.jsonl");
+  const impossible = JSON.parse(JSON.stringify({ ...record({ identity: null }), identitySource: "forwarded-header" })) as Json;
+  const hash = chainHash(0, "2026-01-01T00:00:00.000Z", GENESIS_PREV, impossible);
+  await writeFile(path, JSON.stringify({ seq: 0, at: "2026-01-01T00:00:00.000Z", prev: GENESIS_PREV, hash, record: impossible }) + "\n", "utf8");
+  const read = await readLedger(path);
+  assert.equal(read.entries.length, 0);
+  assert.match(read.problem ?? "", /does not carry a parseable record/);
 });

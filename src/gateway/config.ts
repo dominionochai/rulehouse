@@ -78,6 +78,23 @@ export interface GatewayListen {
 const DEFAULT_LISTEN: GatewayListen = { host: "127.0.0.1", port: 8080, path: "/mcp" };
 const KEY_HASH_PATTERN = /^sha256:[0-9a-f]{64}$/;
 
+/**
+ * Opt-in acknowledgement that requests reach the gateway through a trusted
+ * authenticating proxy: the named header carries the identity name an
+ * already-authenticated party acts as. Because the gateway is loopback-only
+ * and cannot verify who set the header, enabling this widens the trust
+ * boundary to every process that can reach the listener; configuration and
+ * startup output say so, and the decision ledger records the basis per
+ * request (`forwarded-header`, versus `bearer-key`). Clients that present a
+ * bearer key are never affected, a bearer key that fails to authenticate is
+ * never downgraded to a forwarded identity, and an asserted value must name
+ * a configured identity exactly.
+ */
+export interface GatewayForwardedIdentity {
+  /** Lower-case header name the trusted proxy sets. */
+  readonly header: string;
+}
+
 export interface GatewayConfig {
   readonly source: string;
   readonly listen: GatewayListen;
@@ -97,6 +114,8 @@ export interface GatewayConfig {
    * request, never cached, so revoking an approval takes effect immediately.
    */
   readonly approvalsPath: string | null;
+  /** Proxy-asserted identity trust, or null (the default) when disabled. */
+  readonly trustForwardedIdentity: GatewayForwardedIdentity | null;
 }
 
 /**
@@ -133,6 +152,7 @@ export function readGatewayConfig(
   const listen = readListen(root["listen"], fail);
   const ledgerPath = readLedgerPath(root["ledger"], fail);
   const approvalsPath = readOptionalString(root["approvals"]);
+  const trustForwardedIdentity = readForwardedIdentity(root["trustForwardedIdentity"], fail);
 
   const viable = upstream !== null && identities !== null && policies !== null && listen !== null;
   const config: GatewayConfig | null = viable && listen !== null
@@ -145,6 +165,7 @@ export function readGatewayConfig(
         ledgerPath,
         provenancePath,
         approvalsPath,
+        trustForwardedIdentity,
       }
     : null;
   return { config, diagnostics };
@@ -444,6 +465,48 @@ function readLedgerPath(
     return DEFAULT_LEDGER_PATH;
   }
   return path;
+}
+
+/**
+ * Header names that already carry credentials or transport state on the
+ * mediated path. Selecting one of them as the identity header would either
+ * recycle a credential as an identity or collide with routing state the
+ * gateway itself forwards, so the configuration is refused outright.
+ */
+const USURPED_HEADERS = new Set([
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "mcp-session-id",
+  "mcp-protocol-version",
+  "traceparent",
+]);
+
+function readForwardedIdentity(
+  value: Json | undefined,
+  fail: (subject: string, message: string) => void,
+): GatewayForwardedIdentity | null {
+  if (value === undefined) return null;
+  const obj = asObject(value);
+  if (obj === null) {
+    fail("/trustForwardedIdentity", 'must be an object with a "header" field');
+    return null;
+  }
+  const header = asString(obj["header"]);
+  if (header === null || header.length === 0) {
+    fail("/trustForwardedIdentity/header", "is required when trustForwardedIdentity is configured: the header whose value names a configured identity");
+    return null;
+  }
+  const normalized = header.toLowerCase();
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(normalized)) {
+    fail("/trustForwardedIdentity/header", `"${header}" is not a valid header name`);
+    return null;
+  }
+  if (USURPED_HEADERS.has(normalized)) {
+    fail("/trustForwardedIdentity/header", `"${header}" already carries credentials or transport state on the mediated path and cannot carry a proxy-asserted identity`);
+    return null;
+  }
+  return { header: normalized };
 }
 
 function readOptionalString(value: Json | undefined): string | null {

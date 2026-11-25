@@ -261,6 +261,9 @@ async function commandServe(options: CommandLine): Promise<number> {
     return 2;
   }
   const config = loaded.config;
+  if (config.trustForwardedIdentity !== null) {
+    process.stderr.write(`rulehouse gateway: proxy-asserted identity is ENABLED; requests reaching the listener through any other channel than the trusted proxy are attributed from the "${config.trustForwardedIdentity.header}" header\n`);
+  }
   const handle = await createGateway(config, (name) => process.env[name]);
   await handle.listen();
   await new Promise<void>((resolve) => {

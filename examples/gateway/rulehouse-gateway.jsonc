@@ -6,7 +6,19 @@
 //
 // The upstream credential is read from the environment at startup and is
 // never written to disk or logs by the gateway.
+//
+// Proxy-asserted identity (opt-in, off by default): when the gateway runs
+// behind a trusted authenticating reverse proxy, that proxy is in a position
+// to know who the caller is. Uncommenting the block below tells the gateway
+// to attribute key-less requests to the configured identity named by the
+// header's value. This widens the trust boundary to every process that can
+// reach the loopback listener: the proxy must strip any client-supplied copy
+// of the header. Every decision records its identitySource (`bearer-key` or
+// `forwarded-header`) so an audit never has to guess which trust path backed
+// a record.
+// "trustForwardedIdentity": { "header": "x-rulehouse-identity" },
 {
+
   "listen": { "host": "127.0.0.1", "port": 8080, "path": "/mcp" },
   "upstream": {
     "url": "https://mcp.atlassian.com/v2/mcp",

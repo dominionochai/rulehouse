@@ -1,0 +1,20 @@
+{
+  "agent": {
+    "tool_permissions": {
+      "default": "confirm",
+      "mcp:atlassian:delete_*": "deny"
+    }
+  },
+  "context_servers": {
+    "atlassian": {
+      "source": "custom",
+      "url": "https://mcp.atlassian.com/v2/mcp",
+      "headers": { "Authorization": "Bearer ${ZED_ATLASSIAN_KEY}" }
+    },
+    "runbook-loader": {
+      "source": "custom",
+      "command": "npx",
+      "args": ["-y", "@corp/runbook-loader"]
+    }
+  }
+}

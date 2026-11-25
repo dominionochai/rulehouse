@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "atlassian": {
+      "httpUrl": "https://mcp.atlassian.com/v2/mcp",
+      "url": "https://mcp.atlassian.com/v2/mcp",
+      "headers": { "Authorization": "Basic c3ZjQGNvcnAuZXhhbXBsZTpSSE8tU1lOVEhFVElDLUdFTUlOSS1UT0tFTg==" },
+      "timeout": 30000
+    },
+    "legacy-atlassian": {
+      "url": "https://mcp.atlassian.com/v1/sse"
+    }
+  },
+  "mcp": { "allowed": ["atlassian"] }
+}

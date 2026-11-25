@@ -1,6 +1,7 @@
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { parseLooseJson, sha256Hex } from "./lib/json.js";
+import { parseToml } from "./lib/toml.js";
 import { parseDocument, type ResolveEnv } from "./parse.js";
 import type { FingerprintedInput, InventoryEntry, ScanDiagnostic } from "./model.js";
 
@@ -28,7 +29,29 @@ const SKIPPED_DIRECTORIES = new Set([
   "venv",
 ]);
 
-const CONFIG_BASENAMES = new Set(["claude_desktop_config.json", ".mcp.json", "mcp.json"]);
+/**
+ * Which files are candidate MCP configurations. A bare basename anywhere
+ * (e.g. `mcp.json` in a project root) is a strong enough signal; generic
+ * names (`settings.json`, `config.toml`) are only candidates inside the
+ * client's own dot-directory, so an unrelated editor settings file never
+ * becomes a false finding.
+ */
+const CONFIG_RULES: readonly { readonly basename: string; readonly markers: readonly string[] | null }[] = [
+  { basename: "claude_desktop_config.json", markers: null },
+  { basename: ".mcp.json", markers: null },
+  { basename: "mcp.json", markers: null },
+  { basename: "mcp_config.json", markers: null },
+  { basename: "settings.json", markers: ["/.zed/", "/.gemini/"] },
+  { basename: "config.toml", markers: ["/.codex/"] },
+];
+
+function isCandidate(relativePath: string): boolean {
+  const name = relativePath.slice(relativePath.lastIndexOf("/") + 1);
+  const directory = relativePath.slice(0, -name.length);
+  const rule = CONFIG_RULES.find((candidate) => candidate.basename === name);
+  if (rule === undefined) return false;
+  return rule.markers === null || rule.markers.some((marker) => `/${directory}`.includes(marker));
+}
 
 /**
  * Walks the scan root, hashes every recognized configuration file, and parses
@@ -53,7 +76,9 @@ export async function scanRoot(root: string, resolveEnv: ResolveEnv): Promise<Sc
       continue;
     }
     inputs.push({ path: relativePath, sha256: sha256Hex(bytes), bytes: bytes.length });
-    const parsed = parseLooseJson(bytes.toString("utf8"), relativePath);
+    const parsed = relativePath.endsWith(".toml")
+      ? parseToml(bytes.toString("utf8"), relativePath)
+      : parseLooseJson(bytes.toString("utf8"), relativePath);
     diagnostics.push(...parsed.diagnostics.map((d) => ({ source: d.source, subject: "$", message: d.message })));
     const result = parseDocument(parsed.value, relativePath, resolveEnv);
     inventory.push(...result.entries);
@@ -79,7 +104,7 @@ async function listCandidateFiles(dir: string, prefix: string = ""): Promise<str
       }
       continue;
     }
-    if (entry.isFile() && CONFIG_BASENAMES.has(entry.name)) {
+    if (entry.isFile() && isCandidate(relativePath)) {
       found.push(relativePath);
     }
   }

@@ -1,7 +1,7 @@
 {
   "name": "rulehouse",
-  "version": "0.4.0",
-  "description": "Rulehouse Continuous Assurance — inventory and policy verification for Atlassian MCP configurations.",
+  "version": "0.5.0",
+  "description": "Rulehouse — enterprise security control plane for AI-connected systems: continuous assurance, MCP gateway, provenance, and delegation governance.",
   "license": "Apache-2.0",
   "type": "module",
   "engines": {

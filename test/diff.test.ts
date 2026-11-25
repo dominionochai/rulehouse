@@ -14,6 +14,7 @@ function entry(client: InventoryEntry["client"], serverName: string, overrides: 
     endpointClass: "atlassian-v2",
     auth: { kind: "oauth" },
     toolsOverride: null,
+    disabledTools: null,
     source: { file: `${client}/config.json`, pointer: `/mcpServers/${serverName}`, format: client },
     ...overrides,
   };

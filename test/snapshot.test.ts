@@ -16,6 +16,7 @@ function fakeEntry(serverName: string): InventoryEntry {
     endpointClass: "atlassian-v2",
     auth: { kind: "oauth" },
     toolsOverride: null,
+    disabledTools: null,
     source: { file: "cursor/.cursor/mcp.json", pointer: `/mcpServers/${serverName}`, format: "cursor" },
   };
 }

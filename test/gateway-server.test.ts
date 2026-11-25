@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import type { Server } from "node:http";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { appendFile, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -57,6 +57,7 @@ async function startStack(customize?: (config: GatewayConfig) => GatewayConfig):
     ledgerPath,
     provenancePath: null,
     approvalsPath,
+    trustForwardedIdentity: null,
   };
   const effective = customize === undefined ? config : customize(config);
   const gateway = await createGateway(effective, (name) => (name === "TEST_UPSTREAM_CREDENTIAL" ? UPSTREAM_TOKEN : undefined));
@@ -77,13 +78,21 @@ async function startStack(customize?: (config: GatewayConfig) => GatewayConfig):
   };
 }
 
-async function post(stack: Stack, path: string, body: unknown, clientKey?: string, sessionId?: string): Promise<{ readonly status: number; readonly headers: Headers; readonly body: string }> {
+async function post(
+  stack: Stack,
+  path: string,
+  body: unknown,
+  clientKey?: string,
+  sessionId?: string,
+  extraHeaders: Record<string, string | string[]> = {},
+): Promise<{ readonly status: number; readonly headers: Headers; readonly body: string }> {
   const response = await fetch(`${stack.base}${path}`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
       ...(clientKey === undefined ? {} : { authorization: `Bearer ${clientKey}` }),
       ...(sessionId === undefined ? {} : { "mcp-session-id": sessionId }),
+      ...extraHeaders,
     },
     body: JSON.stringify(body),
   });
@@ -346,3 +355,106 @@ test("a corrupt provenance registry blocks checked tools instead of guessing", a
     await stack.stop();
   }
 });
+
+const ASSERTED_HEADER = "x-rulehouse-identity";
+
+function forwardedIdentityStack(): (config: GatewayConfig) => GatewayConfig {
+  return (config) => ({ ...config, trustForwardedIdentity: { header: ASSERTED_HEADER } });
+}
+
+test("without the opt-in, an identity assertion header has no authority at all", async () => {
+  const stack = await startStack();
+  try {
+    const refused = await post(stack, "/mcp", toolCall(7, "get_issue"), undefined, undefined, { [ASSERTED_HEADER]: "amara" });
+    assert.equal(refused.status, 401, "an unconfigured header must not authenticate anyone");
+    assert.equal(stack.upstream.length, 0);
+  } finally {
+    await stack.stop();
+  }
+  const read = await readLedger(stack.ledgerPath);
+  assert.equal(read.entries[0]!.record.identity, null);
+  assert.equal(read.entries[0]!.record.identitySource, null);
+});
+
+test("with the opt-in, a proxy-asserted identity drives policy and the ledger names its basis", async () => {
+  const stack = await startStack(forwardedIdentityStack());
+  try {
+    const allowed = await post(stack, "/mcp", toolCall(7, "get_issue"), undefined, undefined, { [ASSERTED_HEADER]: "amara" });
+    assert.equal(allowed.status, 200);
+  } finally {
+    await stack.stop();
+  }
+  const read = await readLedger(stack.ledgerPath);
+  const entry = read.entries[0]!;
+  assert.equal(entry.record.identity, "amara");
+  assert.equal(entry.record.identitySource, "forwarded-header");
+  assert.equal(entry.record.decision.kind, "allowed");
+  assert.equal((await verifyLedger(stack.ledgerPath)).ok, true);
+});
+
+test("an assertion naming no configured identity is refused", async () => {
+  const stack = await startStack(forwardedIdentityStack());
+  try {
+    const refused = await post(stack, "/mcp", toolCall(7, "get_issue"), undefined, undefined, { [ASSERTED_HEADER]: "nobody" });
+    assert.equal(refused.status, 401);
+    assert.equal(stack.upstream.length, 0);
+  } finally {
+    await stack.stop();
+  }
+});
+
+test("an assertion cannot deploy another identity's authority against a live key", async () => {
+  const stack = await startStack((config) => ({
+    ...forwardedIdentityStack()(config),
+    identities: [...config.identities, { name: "contractor", kind: "user" as const, keyHash: `sha256:${createHash("sha256").update("RHO-SYNTHETIC-CONTRACTOR-KEY").digest("hex")}` }],
+    policies: {
+      ...config.policies,
+      rules: [...config.policies.rules, { id: "RH-GW-BLOCK-MUTATE", identities: null, tools: ["update_*"], effect: "deny" as const, approvalRequired: false, provenanceChecks: [] }],
+    },
+  }));
+  try {
+    assert.equal((await post(stack, "/mcp", toolCall(7, "get_issue"), CLIENT_KEY, undefined, { [ASSERTED_HEADER]: "contractor" })).status, 200);
+    const denied = await post(stack, "/mcp", toolCall(8, "update_issue"), CLIENT_KEY, undefined, { [ASSERTED_HEADER]: "contractor" });
+    assert.equal(denied.status, 403, "the bearer identity's own policies apply, not the asserted name's");
+  } finally {
+    await stack.stop();
+  }
+  const read = await readLedger(stack.ledgerPath);
+  assert.equal(read.entries.filter((entry) => entry.record.identitySource === "bearer-key").length, 2);
+});
+
+test("a bearer key that fails to authenticate is never downgraded to a forwarded identity", async () => {
+  const stack = await startStack(forwardedIdentityStack());
+  try {
+    const refused = await post(stack, "/mcp", toolCall(7, "get_issue"), "imposter-key", undefined, { [ASSERTED_HEADER]: "amara" });
+    assert.equal(refused.status, 401);
+    assert.equal(stack.upstream.length, 0);
+  } finally {
+    await stack.stop();
+  }
+  const read = await readLedger(stack.ledgerPath);
+  assert.equal(read.entries[0]!.record.identitySource, null);
+});
+
+test("a duplicated assertion header refuses authentication outright", async () => {
+  const stack = await startStack(forwardedIdentityStack());
+  try {
+    const raw = await rawPost(stack, "/mcp", JSON.stringify(toolCall(7, "get_issue")), { [ASSERTED_HEADER]: ["amara", "amara"] });
+    assert.equal(raw.status, 401, "a repeated assertion is either a proxy bug or an injection attempt");
+    assert.equal(stack.upstream.length, 0);
+  } finally {
+    await stack.stop();
+  }
+});
+
+function rawPost(stack: Stack, path: string, body: string, headers: Record<string, string | string[]>): Promise<{ readonly status: number }> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(`${stack.base}${path}`);
+    const request = httpRequest({ host: url.hostname, port: url.port, path, method: "POST", headers: { "content-type": "application/json", ...headers } }, (response) => {
+      response.resume();
+      response.on("end", () => resolve({ status: response.statusCode ?? 0 }));
+    });
+    request.on("error", reject);
+    request.end(body);
+  });
+}
