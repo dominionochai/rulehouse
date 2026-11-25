@@ -2,6 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createServer, type Server } from "node:http";
+import { Readable } from "node:stream";
 import type { GatewayConfig, GatewayIdentity } from "./config.js";
 import type { IdentityBasis } from "./ledger.js";
 import { METHOD_RULE_ID, evaluateToolCall, type Decision } from "./authorize.js";
@@ -14,7 +15,15 @@ export const JSONRPC_INVALID_REQUEST = -32600;
 export const POLICY_DENIED_CODE = -32003;
 
 const FORWARD_HEADERS = ["mcp-session-id", "mcp-protocol-version", "traceparent"] as const;
+/**
+ * Upstream *response* headers that carry session state back to the client.
+ * The session id the upstream mints on `initialize` is worthless unless it
+ * travels back: without this relay a client could not take part in the very
+ * session the gateway is mediating.
+ */
+const RELAY_HEADERS = ["mcp-session-id", "mcp-protocol-version"] as const;
 const ACCEPT = "application/json, text/event-stream";
+const STREAM_CONTENT_TYPE = "text/event-stream";
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
 
 export interface GatewayHandle {
@@ -360,8 +369,18 @@ async function readApprovals(config: GatewayConfig): Promise<ReadonlySet<string>
 interface UpstreamOutcome {
   readonly forwarded: boolean;
   readonly status: number;
+  /** Complete upstream body for a buffered (application/json) response. */
   readonly body: string;
+  /**
+   * The live upstream body when the upstream answered as a stream. The
+   * decision and the ledger entry are complete before the first byte of this
+   * stream is piped: enforcement happens at authorization time, and a
+   * stream can neither retroactively widen it nor outpace the evidence.
+   */
+  readonly stream: ReadableStream<Uint8Array> | null;
   readonly contentType: string | null;
+  /** Upstream response headers that must relay session state to the client. */
+  readonly relay: Record<string, string>;
 }
 
 /**
@@ -369,6 +388,9 @@ interface UpstreamOutcome {
  * not rewrite, so the upstream answer is exactly what a client holding the
  * upstream credential itself would have received. Any body-level rewrite
  * would need its own evidence discipline before shipping, so there is none.
+ * The response may be streamed or buffered as the upstream chooses; either
+ * way the outcome carries the status and relays by the time it is returned,
+ * which is what lets the ledger entry precede the response bytes.
  */
 async function forward(config: GatewayConfig, upstream: UpstreamCredential, body: string, sessionHeaders: Record<string, string>): Promise<UpstreamOutcome> {
   const headers: Record<string, string> = {
@@ -379,10 +401,19 @@ async function forward(config: GatewayConfig, upstream: UpstreamCredential, body
   };
   try {
     const response = await fetch(config.upstream.url, { method: "POST", headers, body });
-    return { forwarded: true, status: response.status, body: await response.text(), contentType: response.headers.get("content-type") };
+    const relay: Record<string, string> = {};
+    for (const name of RELAY_HEADERS) {
+      const value = response.headers.get(name);
+      if (value !== null) relay[name] = value;
+    }
+    const contentType = response.headers.get("content-type");
+    if (contentType !== null && contentType.includes(STREAM_CONTENT_TYPE) && response.body !== null) {
+      return { forwarded: true, status: response.status, body: "", stream: response.body, contentType, relay };
+    }
+    return { forwarded: true, status: response.status, body: await response.text(), stream: null, contentType, relay };
   } catch (error) {
     process.stderr.write(`rulehouse gateway: upstream unreachable: ${(error as Error).message}\n`);
-    return { forwarded: false, status: 0, body: "", contentType: null };
+    return { forwarded: false, status: 0, body: "", stream: null, contentType: null, relay: {} };
   }
 }
 
@@ -429,13 +460,31 @@ async function forwardAndRecord(
  * belongs to the upstream and must reach the client unedited. Only a gateway
  * to upstream failure produces a gateway-authored JSON-RPC error, because
  * that is the one case the client would otherwise read as a silent hang.
+ * A streamed answer is piped through, not re-serialized, so SSE framing and
+ * event boundaries leave the gateway exactly as the upstream produced them;
+ * no `content-length` is invented for a stream because its length belongs to
+ * the upstream, not to the gateway.
  */
 function deliver(response: ServerResponse, id: string | number | null, outcome: UpstreamOutcome): void {
   if (!outcome.forwarded) {
     respondJsonRpc(response, 502, id, { code: POLICY_DENIED_CODE, message: "upstream was unreachable; the operation was not executed" });
     return;
   }
-  respondRaw(response, outcome.status, outcome.body, outcome.contentType ?? "application/json");
+  const headers: Record<string, string> = {};
+  if (outcome.contentType !== null) headers["content-type"] = outcome.contentType;
+  for (const [name, value] of Object.entries(outcome.relay)) headers[name] = value;
+  if (outcome.stream === null) {
+    response.writeHead(outcome.status, { ...headers, "content-length": Buffer.byteLength(outcome.body) });
+    response.end(outcome.body);
+    return;
+  }
+  response.writeHead(outcome.status, headers);
+  const source = Readable.fromWeb(outcome.stream);
+  source.on("error", (error: Error) => {
+    process.stderr.write(`rulehouse gateway: upstream stream broke mid-response: ${error.message}\n`);
+    response.destroy();
+  });
+  source.pipe(response);
 }
 
 interface Rejection {

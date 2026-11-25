@@ -113,13 +113,59 @@ authenticated, i.e. decision-grade attribution for requests it mediates.
 It does not claim to change or repair Atlassian's native audit records.
 
 **Prototype limits, stated as limits.** Requests are forwarded
-byte-for-byte over stateless HTTP POST (JSON mode); SSE-streamed MCP
-sessions and body rewriting are not implemented. There is no TLS — the
-config loader refuses any non-loopback bind and remote deployments must
-sit behind a TLS-terminating proxy. An unreachable upstream fails
-closed: the operation is not executed and the failure is recorded as
-`failed-forwarding`, which the ledger keeps distinct from both
-`blocked-at-gateway` and `forwarded-to-upstream`.
+byte-for-byte; the gateway never rewrites request or response bodies.
+There is no TLS — the config loader refuses any non-loopback bind and
+remote deployments must sit behind a TLS-terminating proxy. An
+unreachable upstream fails closed: the operation is not executed and
+the failure is recorded as `failed-forwarding`, which the ledger keeps
+distinct from both `blocked-at-gateway` and `forwarded-to-upstream`.
+
+### MCP transport support in the gateway
+
+The gateway speaks the MCP **streamable HTTP** transport for
+request/response traffic: clients POST JSON-RPC, and the upstream's
+answer is delivered verbatim, whether it arrives as buffered
+`application/json` or as `text/event-stream`. Streamed answers are
+piped through byte-for-byte — SSE framing and event boundaries are not
+re-serialized, and no `content-length` is invented, because the length
+of a stream belongs to the upstream, not the gateway. Policy evaluation and
+the ledger record complete before the first response byte is piped, so
+the enforcement result for a streamed call is the same as for a
+buffered one: `blocked-at-gateway`, `forwarded-to-upstream`, or
+`failed-forwarding`.
+
+Session transport is mediated too: the `mcp-session-id` and
+`mcp-protocol-version` headers the client sends are forwarded on every
+(upstream) request, and the session id the *upstream* mints on
+`initialize` is relayed back to the client — otherwise the client could
+not take part in the session the gateway is mediating.
+
+Transport behaviors deliberately NOT handled (each is a boundary, not
+an oversight):
+
+- **Standalone SSE listening streams (GET).** The GET channel meant for
+  server-initiated notifications receives `405`. This is explicitly
+  allowed by the MCP streamable-HTTP specification for servers that do
+  not offer the channel; client-initiated POST traffic is unaffected.
+- **Session termination (DELETE).** Also answered `405`, which the
+  specification likewise permits. A session ends when the upstream ends
+  it, not when the gateway is asked to forget it.
+- **No session-to-identity binding.** The gateway forwards a client's
+  session id as presented; it does not yet verify that the session was
+  established by the same identity that is using it now. Any
+  authenticated identity can ride any session id the upstream accepts.
+  This is a real gap in multi-user deployments and is on the roadmap.
+- **JSON-RPC batch requests are refused, not split.** An array body
+  produces a parse rejection and nothing is forwarded; batch mediation
+  (per-member policy decisions in one response) is not implemented.
+- **No per-stream deadline.** If the upstream opens a stream and never
+  ends it, the gateway's response stays open with it. A stream that
+  breaks mid-response is destroyed, not retried; the ledger entry
+  written at response-head time stands, and the client sees a truncated
+  stream.
+- **No response-body inspection.** What the upstream streams back is
+  not policy-checked; enforcement is at the request boundary, before
+  execution.
 
 ## Provenance on mediated paths (Phase 3)
 
