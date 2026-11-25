@@ -120,6 +120,22 @@ unreachable upstream fails closed: the operation is not executed and
 the failure is recorded as `failed-forwarding`, which the ledger keeps
 distinct from both `blocked-at-gateway` and `forwarded-to-upstream`.
 
+### Deployment: loopback by default, TLS-terminating proxy for remote access
+
+The gateway is loopback-only by construction: the config loader accepts
+`127.0.0.1`/`localhost` and refuses every other bind (tested for both).
+Remote access is a deployment shape, not a gateway feature: put an
+authenticating TLS-terminating reverse proxy in front — ideally the
+same proxy that asserts identity (Phase 5's opt-in
+`trustForwardedIdentity`). `docs/deployment.md` holds the reference
+configuration, the two load-bearing proxy contracts (set, never append;
+strip what you do not set — both pinned by tests, one of them
+demonstrating the gateway's duplicate-assertion fail-closed refusal and
+one honestly demonstrating the hazard when a proxy strips nothing), and
+an explicit statement of what such a deployment does and does not
+protect — including that a misconfigured or compromised proxy can assert
+identities and that nothing here repairs upstream audit trails.
+
 ### MCP transport support in the gateway
 
 The gateway speaks the MCP **streamable HTTP** transport for
