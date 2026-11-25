@@ -1,4 +1,4 @@
-# Rulehouse — Continuous Assurance
+# Rulehouse
 
 Rulehouse is an enterprise security control plane for governing how
 AI-connected systems access organizational information. The repository
